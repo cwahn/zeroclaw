@@ -18,7 +18,10 @@ enum SocketStartupState {
     #[default]
     Pending,
     Ready,
-    Fatal(String),
+    Fatal {
+        kind: std::io::ErrorKind,
+        message: String,
+    },
 }
 
 #[derive(Clone)]
@@ -50,13 +53,16 @@ impl SocketStartupTracker {
     }
 
     fn record_error(&self, error: &anyhow::Error) {
-        if !is_addr_in_use(error) {
+        let Some(kind) = fatal_socket_startup_kind(error) else {
             return;
-        }
+        };
 
         self.state_tx.send_if_modified(|state| {
             if matches!(state, SocketStartupState::Pending) {
-                *state = SocketStartupState::Fatal(format!("{error:#}"));
+                *state = SocketStartupState::Fatal {
+                    kind,
+                    message: format!("{error:#}"),
+                };
                 true
             } else {
                 false
@@ -65,10 +71,20 @@ impl SocketStartupTracker {
     }
 }
 
-fn is_addr_in_use(error: &anyhow::Error) -> bool {
+/// Startup errors no supervisor restart can recover from: the endpoint is
+/// already owned by another daemon, or the configured path can never be bound
+/// (for example a Unix socket path over the platform `sun_path` limit, which
+/// `std` reports as `InvalidInput` before the syscall).
+fn fatal_socket_startup_kind(error: &anyhow::Error) -> Option<std::io::ErrorKind> {
     error
         .downcast_ref::<std::io::Error>()
-        .is_some_and(|error| error.kind() == std::io::ErrorKind::AddrInUse)
+        .map(std::io::Error::kind)
+        .filter(|kind| {
+            matches!(
+                kind,
+                std::io::ErrorKind::AddrInUse | std::io::ErrorKind::InvalidInput
+            )
+        })
 }
 
 #[derive(Clone)]
@@ -192,7 +208,7 @@ impl Drop for StartupReadinessAttempt {
 }
 
 mod registry;
-pub use registry::{DaemonRegistry, GatewayReloadControls};
+pub use registry::{DaemonInboundAuthority, DaemonRegistry, GatewayReloadControls};
 
 const STATUS_FLUSH_SECONDS: u64 = 5;
 
@@ -516,6 +532,7 @@ pub async fn run(
     crate::agent::pricing_catalog::load_global_pricing_catalog(&config.data_dir);
 
     let mut handles: Vec<JoinHandle<()>> = vec![spawn_state_writer(config.clone())];
+    let mut channels_handle: Option<JoinHandle<()>> = None;
 
     // Reload channel: gateway's /admin/reload writes here; our wait loop
     // (below) selects on it alongside OS signals. Cross-platform.
@@ -538,9 +555,37 @@ pub async fn run(
     let tui_registry =
         std::sync::Arc::new(crate::rpc::tui_identity::TuiRegistry::new(&config.data_dir));
 
+    // Canonical live pairing authority for this daemon generation. The
+    // gateway serves /pair, rotation, and revocation from THIS instance
+    // and the RPC native auth provider verifies against it, so a pairing
+    // change reaches both surfaces immediately (no boot-time snapshot).
+    let pairing_guard = std::sync::Arc::new(zeroclaw_config::pairing::PairingGuard::new(
+        config.gateway.require_pairing,
+        &config.gateway.paired_tokens,
+        config.gateway.pairing_code,
+    ));
+
+    // One inbound-auth state for this daemon generation. The RPC context
+    // and the supervised gateway authenticate against the same accepted
+    // policy over the same live configuration, and both publish into it
+    // under the process-wide config write lock. A revocation persisted
+    // through either surface therefore binds the other before the writer
+    // returns, not at the next daemon reload.
+    let live_config = std::sync::Arc::new(parking_lot::RwLock::new(config.clone()));
+    let inbound_auth = std::sync::Arc::new(
+        crate::rpc::auth::RpcInboundAuth::from_config(&config, pairing_guard.clone()).map_err(
+            |e| anyhow::Error::msg(format!("building the inbound authentication layer: {e:#}")),
+        )?,
+    );
+
     if let Some(gateway_start) = registry.take_gateway_start() {
         gateway_required = true;
         let gateway_cfg = config.clone();
+        let gateway_authority = DaemonInboundAuthority {
+            pairing: pairing_guard.as_ref().clone(),
+            inbound_auth: std::sync::Arc::clone(&inbound_auth),
+            config: std::sync::Arc::clone(&live_config),
+        };
         let gateway_host = host.clone();
         let gateway_event_tx = event_tx.clone();
         let gateway_reload_controls = GatewayReloadControls {
@@ -562,6 +607,7 @@ pub async fn run(
                 let reload_controls = gateway_reload_controls.clone();
                 let tui_reg = gateway_tui_registry.clone();
                 let start = gateway_start.clone();
+                let authority = gateway_authority.clone();
                 let (readiness_attempt, readiness_reporter) =
                     StartupReadinessAttempt::gateway(gateway_readiness_tx.clone());
                 async move {
@@ -573,6 +619,7 @@ pub async fn run(
                         Some(tx),
                         Some(reload_controls),
                         Some(tui_reg),
+                        Some(authority),
                         readiness_reporter,
                     )
                     .await
@@ -609,7 +656,7 @@ pub async fn run(
             let channels_cfg = config.clone();
             let channels_start = std::sync::Arc::new(channels_start);
             let cancel_for_supervisor = channels_cancel.clone();
-            handles.push(spawn_component_supervisor(
+            channels_handle = Some(spawn_component_supervisor(
                 "channels",
                 initial_backoff,
                 max_backoff,
@@ -647,7 +694,7 @@ pub async fn run(
         || registry.has_enroll_start();
 
     // Extract shared SOP engine from registry for RpcContext.
-    let (sop_engine, sop_audit) = registry.take_sop_engine();
+    let (sop_engine, sop_audit, sop_driver_handles) = registry.take_sop_engine();
 
     let rpc_ctx = if need_rpc_ctx {
         use crate::rpc::context::RpcContext;
@@ -767,16 +814,23 @@ pub async fn run(
             };
 
         let hooks: Option<std::sync::Arc<crate::hooks::HookRunner>> = if config.hooks.enabled {
-            Some(std::sync::Arc::new(crate::hooks::HookRunner::from_config(
-                &config.hooks,
-            )))
+            Some(std::sync::Arc::new(
+                crate::hooks::HookRunner::from_root_config(&config),
+            ))
         } else {
             None
         };
 
+        // The generation's shared inbound-auth state (see `inbound_auth`
+        // above): the gateway authenticates and publishes against these same
+        // instances.
+        let rpc_auth = std::sync::Arc::clone(&inbound_auth);
+
         Some(std::sync::Arc::new(RpcContext {
-            config: std::sync::Arc::new(parking_lot::RwLock::new(config.clone())),
-            config_write_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            config_commit_pause: None,
+            config: std::sync::Arc::clone(&live_config),
+            config_write_lock: zeroclaw_config::write_lock::shared_config_write_lock(),
             sessions,
             session_backend,
             memory: rpc_memory,
@@ -797,8 +851,10 @@ pub async fn run(
             acp_session_store,
             sop_engine,
             sop_audit,
+            sop_driver_handles,
             hooks,
             cert_audit,
+            auth: rpc_auth,
         }))
     } else {
         None
@@ -991,6 +1047,7 @@ pub async fn run(
 
     // Wait for shutdown (SIGINT/SIGTERM/Ctrl+C), reload (in-process channel),
     // or an unrecoverable initial socket ownership conflict.
+    let rpc_connection_count = socket_client_count.clone();
     let exit = wait_for_exit_signal(reload_rx, ephemeral, socket_client_count);
     tokio::pin!(exit);
 
@@ -1047,6 +1104,29 @@ pub async fn run(
 
     channels_cancel.cancel();
 
+    // Retire the accepted RPC connections before the component handles are
+    // touched. Each connection cancels and joins its prompts, and its listener
+    // force-aborts it after `rpc::CONNECTION_DRAIN_GRACE`; the liveness token
+    // every task started by the connection holds keeps the count above zero
+    // until those tasks have actually ended, so waiting for zero is what stops
+    // the replacement generation from admitting work for a session the
+    // retiring generation is still unwinding. A reload that cannot establish
+    // that is refused below instead of handing over. Only this wait carries
+    // the listeners' budget: the per-component grace below stays as it was, so
+    // an unrelated pending component adds no reload latency.
+    let drain = await_rpc_connection_drain(&rpc_connection_count).await;
+    let exit_result = settle_exit_against_drain(exit_result, drain);
+
+    // Channel teardown owns listener cleanup plus all accepted message work.
+    // Keep that supervisor out of the generic 500 ms component pool: its
+    // internal absolute deadline is five seconds, and a reload may start a
+    // replacement generation only after this owner has actually retired.
+    let channels_retired = retire_channels_supervisor(channels_handle).await;
+    let exit_result = settle_exit_against_channel_retirement(exit_result, channels_retired);
+
+    // Grace window for cooperative shutdown of each component supervisor. The
+    // RPC listeners are already past their own drain by this point, so this
+    // only covers the supervisor loop returning after its component did.
     const GRACE_WINDOW: Duration = Duration::from_millis(500);
     let deadline = tokio::time::Instant::now() + GRACE_WINDOW;
     let mut remaining: Vec<JoinHandle<()>> = Vec::new();
@@ -1133,10 +1213,13 @@ async fn await_socket_startup(
         .map(|state| state.clone())
     {
         Ok(SocketStartupState::Ready) => Ok(()),
-        Ok(SocketStartupState::Fatal(message)) => {
-            Err(std::io::Error::new(std::io::ErrorKind::AddrInUse, message).into())
+        Ok(SocketStartupState::Fatal { kind, message }) => {
+            Err(std::io::Error::new(kind, message).into())
         }
-        Ok(SocketStartupState::Pending) => unreachable!("wait_for excludes pending state"),
+        Ok(SocketStartupState::Pending) => Err(std::io::Error::other(
+            "socket startup remained pending after readiness wait",
+        )
+        .into()),
         Err(_) => Ok(()),
     }
 }
@@ -1236,6 +1319,133 @@ fn spawn_state_writer(config: Config) -> JoinHandle<()> {
     })
 }
 
+/// Whether the RPC connections accepted by the retiring generation finished
+/// draining within the shutdown budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RpcDrain {
+    /// Every accepted connection, and every task it started, has ended.
+    Complete,
+    /// The budget expired with this many connections still unwinding.
+    Outstanding(usize),
+}
+
+/// Wait for the connections the RPC listeners accepted to finish draining.
+///
+/// `count` is decremented when the last task started by a connection has
+/// ended: the connection task, each prompt it spawned, and the nested turn task
+/// each hold a clone of the connection's liveness token. A count of zero is
+/// therefore the daemon-visible proof that no old-generation work is still
+/// running, not merely that the connection task was aborted. The wait is
+/// bounded just past the listeners' own forced-abort deadline
+/// (`rpc::CONNECTION_DRAIN_GRACE`), the point at which a connection that
+/// ignored cancellation is aborted. Returns immediately when no connection was
+/// accepted, which is also the case when no RPC listener is running at all.
+pub(crate) async fn await_rpc_connection_drain(count: &std::sync::atomic::AtomicUsize) -> RpcDrain {
+    use std::sync::atomic::Ordering;
+
+    const POLL_INTERVAL: Duration = Duration::from_millis(25);
+    let deadline = tokio::time::Instant::now()
+        + crate::rpc::CONNECTION_DRAIN_GRACE.saturating_add(Duration::from_millis(500));
+
+    loop {
+        let outstanding = count.load(Ordering::Relaxed);
+        if outstanding == 0 {
+            return RpcDrain::Complete;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({ "connections": outstanding })),
+                "RPC connections still draining when the shutdown budget expired"
+            );
+            return RpcDrain::Outstanding(outstanding);
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Decide what a reload may do once the drain has been attempted.
+///
+/// A reload keeps the process alive and starts a replacement generation over
+/// the same durable sessions, so it is admissible only when the retiring
+/// generation is proven finished. When the drain budget expires with work
+/// still unwinding, the reload is refused and downgraded to a shutdown: the
+/// supervisor restarts a fresh process, which cannot overlap with work this
+/// one never managed to retire. Shutdown exits and failures are returned
+/// unchanged.
+fn settle_exit_against_drain(exit: Result<DaemonExit>, drain: RpcDrain) -> Result<DaemonExit> {
+    let RpcDrain::Outstanding(outstanding) = drain else {
+        return exit;
+    };
+    if !matches!(exit, Ok(DaemonExit::Reload)) {
+        return exit;
+    }
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(::serde_json::json!({ "connections": outstanding })),
+        "Reload refused: RPC work from the retiring generation is still unwinding; shutting down \
+         instead so a replacement generation cannot overlap it"
+    );
+    Ok(DaemonExit::Shutdown)
+}
+
+const CHANNEL_SUPERVISOR_SHUTDOWN_GRACE: Duration = Duration::from_secs(6);
+
+async fn retire_channels_supervisor(handle: Option<JoinHandle<()>>) -> bool {
+    let Some(mut handle) = handle else {
+        return true;
+    };
+    tokio::select! {
+        biased;
+        result = &mut handle => {
+            if let Err(error) = result {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({ "error": error.to_string() })),
+                    "Channel supervisor ended without establishing clean retirement"
+                );
+                false
+            } else {
+                true
+            }
+        }
+        () = tokio::time::sleep(CHANNEL_SUPERVISOR_SHUTDOWN_GRACE) => {
+            handle.abort();
+            let _ = handle.await;
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "Channel supervisor did not retire inside its shutdown allowance"
+            );
+            false
+        }
+    }
+}
+
+fn settle_exit_against_channel_retirement(
+    exit: Result<DaemonExit>,
+    channels_retired: bool,
+) -> Result<DaemonExit> {
+    if channels_retired || !matches!(exit, Ok(DaemonExit::Reload)) {
+        return exit;
+    }
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+        "Reload refused: channel work from the retiring generation is still unwinding; shutting \
+         down instead so a replacement generation cannot overlap it"
+    );
+    Ok(DaemonExit::Shutdown)
+}
+
 fn spawn_component_supervisor<F, Fut>(
     name: &'static str,
     initial_backoff_secs: u64,
@@ -1297,17 +1507,18 @@ where
                     }
                 }
                 Err(e) => {
-                    crate::health::mark_component_error(name, e.to_string());
+                    let error_chain = format!("{e:#}");
+                    crate::health::mark_component_error(name, &error_chain);
                     ::zeroclaw_log::record!(
                         ERROR,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({
-                                "error": format!("{}", e),
+                                "error": &error_chain,
                                 "name": name,
                                 "ran_for_secs": ran_for.as_secs(),
                             })),
-                        &format!("Daemon component '{name}' failed: {e}")
+                        &format!("Daemon component '{name}' failed: {error_chain}")
                     );
                     // A long-lived run that eventually errors is not a
                     // fast-fail loop; let it reset so a component that ran fine
@@ -2498,7 +2709,7 @@ fn auto_detect_heartbeat_channel(config: &Config) -> Option<(String, String)> {
     // channel block).
     if !config.channels.telegram.is_empty() {
         for alias in config.channels.telegram.keys() {
-            let peers = config.channel_external_peers("telegram", alias);
+            let peers = config.channel_addressable_peers("telegram", alias);
             if let Some(target) = peers.into_iter().next() {
                 return Some(("telegram".to_string(), target));
             }
@@ -2559,6 +2770,103 @@ mod tests {
 
     const DAEMON_DEADLOCK_GUARD: Duration = Duration::from_secs(30);
 
+    /// The reload drain must report the connections that were still unwinding
+    /// when its budget expired, not silently declare the generation retired.
+    #[tokio::test(start_paused = true)]
+    async fn rpc_drain_reports_connections_left_unwinding_when_the_budget_expires() {
+        let count = std::sync::atomic::AtomicUsize::new(2);
+        assert_eq!(
+            await_rpc_connection_drain(&count).await,
+            RpcDrain::Outstanding(2)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rpc_drain_completes_once_the_last_connection_task_ends() {
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let releaser = std::sync::Arc::clone(&count);
+        let release = zeroclaw_spawn::spawn!(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            releaser.store(0, std::sync::atomic::Ordering::Relaxed);
+        });
+        assert_eq!(await_rpc_connection_drain(&count).await, RpcDrain::Complete);
+        release.await.unwrap();
+    }
+
+    /// A reload hands the same durable sessions to a replacement generation, so
+    /// it is admissible only on proof that the retiring generation is finished.
+    #[test]
+    fn reload_is_refused_when_rpc_work_is_still_unwinding() {
+        assert_eq!(
+            settle_exit_against_drain(Ok(DaemonExit::Reload), RpcDrain::Outstanding(1)).unwrap(),
+            DaemonExit::Shutdown,
+            "an undrained reload must shut the process down instead of handing over"
+        );
+        assert_eq!(
+            settle_exit_against_drain(Ok(DaemonExit::Reload), RpcDrain::Complete).unwrap(),
+            DaemonExit::Reload,
+            "a drained reload must still reload"
+        );
+        assert_eq!(
+            settle_exit_against_drain(Ok(DaemonExit::Shutdown), RpcDrain::Outstanding(1)).unwrap(),
+            DaemonExit::Shutdown,
+            "a shutdown is unaffected by the drain verdict"
+        );
+        assert!(
+            settle_exit_against_drain(Err(anyhow::Error::msg("boom")), RpcDrain::Outstanding(1))
+                .is_err(),
+            "a failed daemon run must keep reporting its failure"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn daemon_channels_shutdown_allows_cleanup_past_generic_grace() {
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let finished_by_task = std::sync::Arc::clone(&finished);
+        let handle = zeroclaw_spawn::spawn!(async move {
+            tokio::time::sleep(Duration::from_millis(750)).await;
+            finished_by_task.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        assert!(
+            retire_channels_supervisor(Some(handle)).await,
+            "channel cleanup longer than the generic 500 ms grace must still retire cleanly"
+        );
+        assert!(
+            finished.load(std::sync::atomic::Ordering::SeqCst),
+            "the channel cleanup future must complete rather than be detached"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn daemon_channels_shutdown_refuses_reload_when_retirement_times_out() {
+        struct RetirementProbe(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for RetirementProbe {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe = RetirementProbe(std::sync::Arc::clone(&dropped));
+        let handle = zeroclaw_spawn::spawn!(async move {
+            let _probe = probe;
+            std::future::pending::<()>().await;
+        });
+
+        let retired = retire_channels_supervisor(Some(handle)).await;
+        assert!(!retired, "a timed-out channel generation is not retired");
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "the timed-out supervisor must be aborted and joined"
+        );
+        assert_eq!(
+            settle_exit_against_channel_retirement(Ok(DaemonExit::Reload), retired).unwrap(),
+            DaemonExit::Shutdown,
+            "reload must be refused when channel retirement is unproven"
+        );
+    }
+
     fn test_config(tmp: &TempDir) -> Config {
         let config = Config {
             data_dir: tmp.path().join("data"),
@@ -2580,6 +2888,17 @@ mod tests {
         config.agents.insert(agent_alias.to_string(), agent);
     }
 
+    /// Hold the process-global log broadcast still for a daemon lifecycle test.
+    ///
+    /// `run` calls `set_broadcast_hook`, replacing the sender every
+    /// log-assertion test subscribed to, and those tests only serialize
+    /// against each other. A lifecycle test that calls `run` without this lock
+    /// closes their receiver mid-read, which surfaces as a missing log event.
+    #[must_use]
+    fn hold_log_broadcast() -> impl Drop {
+        zeroclaw_log::__private_test_hook_lock()
+    }
+
     async fn recv_log_event(
         rx: &mut tokio::sync::broadcast::Receiver<serde_json::Value>,
         message: &str,
@@ -2598,7 +2917,12 @@ mod tests {
                     return value;
                 }
                 Ok(Ok(_)) | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
-                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                // A closed channel means the global broadcast hook was replaced
+                // or cleared, not that the record was slow; keep that distinct
+                // from a deadline miss so the failure names the real cause.
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                    panic!("log broadcast closed before event arrived: {message}");
+                }
                 Err(_elapsed) => {}
             }
         }
@@ -3000,6 +3324,37 @@ mod tests {
         );
     }
 
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn supervisor_preserves_component_error_chain() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle =
+            spawn_component_supervisor("daemon-test-error-chain", 60, 60, cancel, || async {
+                Err(anyhow::Error::msg("provider entry has no model")
+                    .context("agents.ox.model_provider"))
+            });
+
+        let expected_chain = "agents.ox.model_provider: provider entry has no model";
+        let expected_message =
+            format!("Daemon component 'daemon-test-error-chain' failed: {expected_chain}");
+        let value = recv_log_event(&mut rx, &expected_message).await;
+        handle.abort();
+        let _ = handle.await;
+
+        assert_eq!(value["attributes"]["error"], expected_chain);
+        let snapshot = crate::health::snapshot_json();
+        assert_eq!(
+            snapshot["components"]["daemon-test-error-chain"]["last_error"],
+            expected_chain
+        );
+    }
+
     #[tokio::test]
     async fn supervisor_marks_unexpected_exit_as_error() {
         let cancel = tokio_util::sync::CancellationToken::new();
@@ -3180,8 +3535,11 @@ mod tests {
                 api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
                 stream_mode: zeroclaw_config::schema::StreamMode::default(),
                 draft_update_interval_ms: 1000,
+                multi_message_delay_ms: 800,
                 interrupt_on_new_message: false,
                 mention_only: false,
+                per_user_session: true,
+                passive_group_context: false,
                 ack_reactions: None,
                 proxy_url: None,
                 approval_timeout_secs: 120,
@@ -3232,6 +3590,8 @@ mod tests {
                 excluded_tools: vec![],
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
+                approval_timeout_secs: 300,
+                purpose_as_instructions: false,
             },
         );
         assert!(has_supervised_channels(&config));
@@ -3481,8 +3841,11 @@ mod tests {
                 api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
                 stream_mode: zeroclaw_config::schema::StreamMode::default(),
                 draft_update_interval_ms: 1000,
+                multi_message_delay_ms: 800,
                 interrupt_on_new_message: false,
                 mention_only: false,
+                per_user_session: true,
+                passive_group_context: false,
                 ack_reactions: None,
                 proxy_url: None,
                 approval_timeout_secs: 120,
@@ -3510,8 +3873,11 @@ mod tests {
                 api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
                 stream_mode: zeroclaw_config::schema::StreamMode::default(),
                 draft_update_interval_ms: 1000,
+                multi_message_delay_ms: 800,
                 interrupt_on_new_message: false,
                 mention_only: false,
+                per_user_session: true,
+                passive_group_context: false,
                 ack_reactions: None,
                 proxy_url: None,
                 approval_timeout_secs: 120,
@@ -3545,6 +3911,52 @@ mod tests {
         let config = Config::default();
         let target = auto_detect_heartbeat_channel(&config);
         assert!(target.is_none());
+    }
+
+    #[test]
+    fn auto_detect_skips_peers_that_are_not_addresses() {
+        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
+
+        // The resolved peer list answers "who is authorized", so it carries a
+        // wildcard and the deny markers for `ignore`. Neither is somewhere a
+        // heartbeat can be sent, and an ignored peer least of all.
+        let mut config = Config::default();
+        config.channels.telegram.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::TelegramConfig {
+                enabled: true,
+                bot_token: "bot-token".into(),
+                api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
+                stream_mode: zeroclaw_config::schema::StreamMode::default(),
+                draft_update_interval_ms: 1000,
+                interrupt_on_new_message: false,
+                mention_only: false,
+                ack_reactions: None,
+                proxy_url: None,
+                approval_timeout_secs: 120,
+                excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
+                multi_message_delay_ms: 800,
+                debounce_ms: None,
+                per_user_session: true,
+                passive_group_context: false,
+            },
+        );
+        config.peer_groups.insert(
+            "telegram_default".to_string(),
+            PeerGroupConfig {
+                channel: "telegram".into(),
+                external_peers: vec![PeerUsername::new("*"), PeerUsername::new("user123")],
+                ignore: vec![PeerUsername::new("user123")],
+                ..PeerGroupConfig::default()
+            },
+        );
+
+        assert!(
+            auto_detect_heartbeat_channel(&config).is_none(),
+            "a wildcard and an ignored peer leave no heartbeat target"
+        );
     }
 
     #[cfg(unix)]
@@ -3591,8 +4003,10 @@ mod tests {
         assert_eq!(result, DaemonExit::Reload);
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn registry_gateway_starter_can_trigger_daemon_reload() {
+        let _broadcast_guard = hold_log_broadcast();
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
         let expected_data_dir = config.data_dir.clone();
@@ -3600,7 +4014,14 @@ mod tests {
 
         let mut registry = DaemonRegistry::new();
         registry.register_gateway(Box::new(
-            move |host, port, config, event_tx, reload_controls, tui_registry, _ready_tx| {
+            move |host,
+                  port,
+                  config,
+                  event_tx,
+                  reload_controls,
+                  tui_registry,
+                  _pairing,
+                  _ready_tx| {
                 let seen_tx = seen_tx.clone();
                 Box::pin(async move {
                     let has_event_tx = event_tx.is_some();
@@ -3663,10 +4084,12 @@ mod tests {
         assert!(has_tui_registry);
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn initial_socket_addr_in_use_fails_daemon_startup() {
         use std::io;
 
+        let _broadcast_guard = hold_log_broadcast();
         for startup_feedback_enabled in [false, true] {
             let tmp = TempDir::new().unwrap();
             let config = test_config(&tmp);
@@ -3715,6 +4138,84 @@ mod tests {
         }
     }
 
+    #[test]
+    fn fatal_socket_startup_kind_covers_unbindable_paths_through_context() {
+        use std::io;
+
+        let unbindable = anyhow::Error::from(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "local IPC socket path is 104 bytes but this platform allows at most 103",
+        ))
+        .context("binding local IPC endpoint");
+        assert_eq!(
+            fatal_socket_startup_kind(&unbindable),
+            Some(io::ErrorKind::InvalidInput)
+        );
+
+        let owned = anyhow::Error::from(io::Error::from(io::ErrorKind::AddrInUse));
+        assert_eq!(
+            fatal_socket_startup_kind(&owned),
+            Some(io::ErrorKind::AddrInUse)
+        );
+
+        let transient = anyhow::Error::from(io::Error::from(io::ErrorKind::PermissionDenied));
+        assert_eq!(fatal_socket_startup_kind(&transient), None);
+        assert_eq!(
+            fatal_socket_startup_kind(&anyhow::Error::msg("not an io error")),
+            None
+        );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn initial_socket_invalid_input_fails_daemon_startup() {
+        use std::io;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let _broadcast_guard = hold_log_broadcast();
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_socket = attempts.clone();
+
+        let mut registry = DaemonRegistry::new();
+        registry.register_socket(Box::new(move |_ctx, _cancel, _client_count, _readiness| {
+            let attempts = attempts_for_socket.clone();
+            Box::pin(async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(anyhow::Error::from(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "local IPC socket path is 104 bytes but this platform allows at most 103",
+                ))
+                .context("binding local IPC endpoint"))
+            })
+        }));
+
+        let result = tokio::time::timeout(
+            DAEMON_DEADLOCK_GUARD,
+            run(config, "127.0.0.1".to_string(), 0, registry, false, false),
+        )
+        .await
+        .expect("daemon must not restart-loop an unbindable socket path");
+        let error = result.expect_err("daemon startup should fail on an unbindable socket path");
+
+        assert_eq!(
+            error.downcast_ref::<io::Error>().map(io::Error::kind),
+            Some(io::ErrorKind::InvalidInput),
+            "the startup error should keep the bind error kind, got: {error:#}"
+        );
+        let message = format!("{error:#}");
+        assert!(message.contains("binding local IPC endpoint"), "{message}");
+        assert!(message.contains("allows at most 103"), "{message}");
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "an unbindable path must fail closed instead of being retried"
+        );
+    }
+
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn socket_addr_in_use_after_readiness_stays_supervised() {
         use std::io;
@@ -3722,6 +4223,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::time::{Duration, timeout};
 
+        let _broadcast_guard = hold_log_broadcast();
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
         config.reliability.channel_initial_backoff_secs = 1;
@@ -3771,10 +4273,98 @@ mod tests {
         );
     }
 
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn reload_waits_for_rpc_connection_drain_without_holding_other_components() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::time::{Duration, Instant, timeout};
+
+        let _broadcast_guard = hold_log_broadcast();
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let accepted = Arc::new(AtomicBool::new(false));
+        let drained = Arc::new(AtomicBool::new(false));
+        let accepted_for_socket = accepted.clone();
+        let drained_for_socket = drained.clone();
+
+        let mut registry = DaemonRegistry::new();
+        registry.register_socket(Box::new(move |_ctx, cancel, client_count, readiness| {
+            let accepted = accepted_for_socket.clone();
+            let drained = drained_for_socket.clone();
+            Box::pin(async move {
+                if let Some(readiness) = readiness {
+                    readiness.report_ready();
+                }
+                // One accepted connection, counted the way a listener counts a
+                // live client.
+                client_count.store(1, Ordering::SeqCst);
+                accepted.store(true, Ordering::SeqCst);
+                cancel.cancelled().await;
+                // A connection whose prompt takes longer than the per-component
+                // grace to unwind before its client-count guard drops.
+                tokio::time::sleep(Duration::from_millis(1200)).await;
+                client_count.store(0, Ordering::SeqCst);
+                drained.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+        }));
+        // The gateway asks for the reload once the connection exists, then
+        // parks: an unrelated pending component must not extend shutdown.
+        registry.register_gateway(Box::new(
+            move |_host,
+                  _port,
+                  _config,
+                  _event_tx,
+                  reload_controls,
+                  _tui_reg,
+                  _pairing,
+                  _ready_tx| {
+                let accepted = accepted.clone();
+                Box::pin(async move {
+                    let reload_tx = reload_controls
+                        .map(|controls| controls.reload_tx)
+                        .expect("daemon should pass reload controls to gateway starter");
+                    while !accepted.load(Ordering::SeqCst) {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    reload_tx.send(true).expect("send reload signal");
+                    std::future::pending::<Result<()>>().await
+                })
+            },
+        ));
+
+        let started = Instant::now();
+        let exit = timeout(
+            Duration::from_secs(8),
+            run(config, "127.0.0.1".to_string(), 0, registry, false, false),
+        )
+        .await
+        .expect("daemon should finish the reload inside the RPC connection drain budget")
+        .expect("daemon run should succeed");
+        let elapsed = started.elapsed();
+
+        assert_eq!(exit, DaemonExit::Reload);
+        assert!(
+            drained.load(Ordering::SeqCst),
+            "reload must wait for the accepted RPC connection to drain before retiring \
+             the listener; aborting the listener at the component grace leaves the \
+             connection's prompt work running into the replacement generation"
+        );
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "a pending unrelated component must not inherit the RPC drain budget; \
+             reload took {elapsed:?}"
+        );
+    }
+
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn scheduler_cooperative_shutdown_observed_through_daemon_reload() {
         use tokio::time::{Duration, timeout};
 
+        let _broadcast_guard = hold_log_broadcast();
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
         config.scheduler.enabled = true;
@@ -3783,7 +4373,14 @@ mod tests {
 
         let mut registry = DaemonRegistry::new();
         registry.register_gateway(Box::new(
-            move |_host, _port, _config, _event_tx, reload_controls, _tui_reg, _ready_tx| {
+            move |_host,
+                  _port,
+                  _config,
+                  _event_tx,
+                  reload_controls,
+                  _tui_reg,
+                  _pairing,
+                  _ready_tx| {
                 Box::pin(async move {
                     let reload_tx = reload_controls
                         .map(|controls| controls.reload_tx)

@@ -34,6 +34,10 @@ impl Acp {
         self.inner.commit_reconnect_handoff();
     }
 
+    pub(crate) fn terminal_statuses(&self) -> Vec<(crate::turn_status::TurnStatus, String)> {
+        self.inner.terminal_statuses()
+    }
+
     pub(crate) fn session_summaries(&self) -> Vec<chat::SidebarSessionSummary> {
         self.inner.session_summaries()
     }
@@ -85,6 +89,7 @@ impl Acp {
         self.inner.add_agent_session(agent_alias).await;
     }
 
+    /// Close one tracked Code session while preserving its durable history.
     pub(crate) async fn close_session(&mut self, session_id: &str) -> bool {
         self.inner.close_session(session_id).await
     }
@@ -133,6 +138,10 @@ impl Acp {
         self.inner.take_help_request()
     }
 
+    pub(crate) fn take_add_session_request(&mut self) -> bool {
+        self.inner.take_add_session_request()
+    }
+
     pub(crate) fn exit_browse_mode(&mut self) {
         self.inner.exit_browse_mode();
     }
@@ -145,7 +154,7 @@ impl Acp {
         self.inner.handle_paste(text);
     }
 
-    pub(crate) fn ctx_tokens(&self) -> (Option<u64>, Option<u64>) {
+    pub(crate) fn ctx_tokens(&self) -> (Option<u64>, Option<u64>, Option<u64>) {
         self.inner.ctx_tokens()
     }
 

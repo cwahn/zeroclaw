@@ -167,7 +167,21 @@ async fn classify_presence(path: &Path, probe: std::io::Result<bool>) -> PathPre
 /// one function so that a metadata failure can never be read as absence on one
 /// platform and as residue on another.
 pub async fn inspect_lifecycle_path(path: &Path) -> PathPresence {
+    // Exercise Windows' negative metadata result through real cascades on any
+    // test host, without changing probes for unrelated paths or concurrent tests.
+    #[cfg(test)]
+    if NEGATIVE_PROBE_PATH
+        .try_with(|forced| forced == path)
+        .unwrap_or(false)
+    {
+        return classify_presence(path, Ok(false)).await;
+    }
     classify_presence(path, tokio::fs::try_exists(path).await).await
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static NEGATIVE_PROBE_PATH: PathBuf;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -577,8 +591,8 @@ pub async fn cascade_owned_state(
     // cascade as memory/session state. Avoid creating an empty DB when the
     // operator has never enabled knowledge.
     let knowledge_path = config.knowledge.resolved_db_path();
-    let knowledge_purge = match knowledge_path.try_exists() {
-        Ok(true) => match zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
+    let knowledge_purge = match inspect_lifecycle_path(&knowledge_path).await {
+        PathPresence::Present => match zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
             &knowledge_path,
             config.knowledge.max_nodes,
         ) {
@@ -611,8 +625,8 @@ pub async fn cascade_owned_state(
                 Default::default()
             }
         },
-        Ok(false) => Default::default(),
-        Err(error) => {
+        PathPresence::Absent => Default::default(),
+        PathPresence::Uninspectable(error) => {
             warnings.push(format!(
                 "knowledge graph inspection ({}): {error}",
                 knowledge_path.display()
@@ -791,8 +805,8 @@ pub async fn cascade_rename_agent(
     };
 
     let knowledge_path = config.knowledge.resolved_db_path();
-    let knowledge_rows = match knowledge_path.try_exists() {
-        Ok(true) => match zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
+    let knowledge_rows = match inspect_lifecycle_path(&knowledge_path).await {
+        PathPresence::Present => match zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
             &knowledge_path,
             config.knowledge.max_nodes,
         ) {
@@ -808,8 +822,8 @@ pub async fn cascade_rename_agent(
                 0
             }
         },
-        Ok(false) => 0,
-        Err(error) => {
+        PathPresence::Absent => 0,
+        PathPresence::Uninspectable(error) => {
             warnings.push(format!(
                 "knowledge graph inspection ({}): {error}",
                 knowledge_path.display()
@@ -981,6 +995,160 @@ mod tests {
             committed_delete_residue_exists(&config, None, None, "victim").await,
             "an uninspectable workspace is residue the retry must see"
         );
+    }
+
+    fn knowledge_lifecycle_config(tmp: &tempfile::TempDir) -> Config {
+        let mut config = Config {
+            config_path: tmp.path().join("install/config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        config.memory.backend = "none".to_string();
+        config.gateway.session_persistence = false;
+        config.channels.session_persistence = false;
+        config.knowledge.db_path = tmp
+            .path()
+            .join("graph/knowledge.db")
+            .to_string_lossy()
+            .into();
+        std::fs::create_dir_all(config.install_root_dir()).unwrap();
+        config
+    }
+
+    async fn blocked_knowledge_cascade_preserves_then_recovers(rename: bool) {
+        use zeroclaw_memory::knowledge_graph::{KnowledgeGraph, KnowledgeScope, NodeType};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = knowledge_lifecycle_config(&tmp);
+        let path = config.knowledge.resolved_db_path();
+        let parent = path.parent().unwrap();
+        std::fs::create_dir_all(parent).unwrap();
+        let old = KnowledgeScope::for_agent("retired", Vec::new());
+        let peer = KnowledgeScope::for_agent("peer", Vec::new());
+        let graph = KnowledgeGraph::new(&path, config.knowledge.max_nodes).unwrap();
+        let node = graph
+            .add_node(&old, NodeType::Pattern, "owned", "recover me", &[], None)
+            .unwrap();
+        let peer_node = graph
+            .add_node(&peer, NodeType::Pattern, "peer", "keep me", &[], None)
+            .unwrap();
+        drop(graph);
+
+        let parked = tmp.path().join("parked-graph");
+        std::fs::rename(parent, &parked).unwrap();
+        std::fs::write(parent, "blocked parent").unwrap();
+        // Run the same cascade with both the host probe and Windows' Ok(false).
+        for negative_probe in [false, true] {
+            let cascade = async {
+                if rename {
+                    let report =
+                        cascade_rename_agent(&config, None, None, "retired", "renamed").await;
+                    assert_eq!(report.knowledge_rows, 0);
+                    report.warnings
+                } else {
+                    let report = cascade_owned_state(
+                        &config,
+                        None,
+                        None,
+                        "retired",
+                        &tmp.path().join(format!("blocked-{negative_probe}")),
+                    )
+                    .await;
+                    assert_eq!(report.knowledge_purged, 0);
+                    report.warnings
+                }
+            };
+            let warnings = if negative_probe {
+                NEGATIVE_PROBE_PATH.scope(path.clone(), cascade).await
+            } else {
+                cascade.await
+            };
+            assert!(
+                warnings
+                    .iter()
+                    .any(|warning| warning.contains("knowledge graph inspection")),
+                "{warnings:?}"
+            );
+            assert!(committed_delete_residue_exists(&config, None, None, "retired").await);
+            assert!(committed_rename_residue_exists(&config, None, None, "retired").await);
+        }
+        std::fs::remove_file(parent).unwrap();
+        std::fs::rename(&parked, parent).unwrap();
+        let graph = KnowledgeGraph::new(&path, config.knowledge.max_nodes).unwrap();
+        assert!(
+            graph.get_node(&old, &node).unwrap().is_some(),
+            "failed cascades must preserve ownership"
+        );
+        drop(graph);
+
+        if rename {
+            let report = cascade_rename_agent(&config, None, None, "retired", "renamed").await;
+            assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+            assert_eq!(report.knowledge_rows, 1);
+        } else {
+            let archive = tmp.path().join("retry");
+            let report = cascade_owned_state(&config, None, None, "retired", &archive).await;
+            assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+            assert_eq!(report.knowledge_purged, 1);
+            let exported = std::fs::read_to_string(archive.join("cascade/knowledge.json")).unwrap();
+            assert!(
+                exported.contains(&node),
+                "purge must leave a recoverable export"
+            );
+        }
+        let graph = KnowledgeGraph::new(&path, config.knowledge.max_nodes).unwrap();
+        assert!(
+            graph.get_node(&old, &node).unwrap().is_none(),
+            "reusing the retired alias must not recover old rows"
+        );
+        assert!(graph.get_node(&peer, &peer_node).unwrap().is_some());
+        if rename {
+            let renamed = KnowledgeScope::for_agent("renamed", Vec::new());
+            assert!(graph.get_node(&renamed, &node).unwrap().is_some());
+        }
+        assert!(!committed_delete_residue_exists(&config, None, None, "retired").await);
+        assert!(!committed_rename_residue_exists(&config, None, None, "retired").await);
+    }
+
+    #[tokio::test]
+    async fn knowledge_delete_warns_preserves_and_retries_blocked_parent_in_both_probe_shapes() {
+        blocked_knowledge_cascade_preserves_then_recovers(false).await;
+    }
+
+    #[tokio::test]
+    async fn knowledge_rename_warns_preserves_and_retries_blocked_parent_in_both_probe_shapes() {
+        blocked_knowledge_cascade_preserves_then_recovers(true).await;
+    }
+
+    #[tokio::test]
+    async fn absent_knowledge_cascades_are_quiet_and_do_not_create_database() {
+        for negative_probe in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = knowledge_lifecycle_config(&tmp);
+            let path = config.knowledge.resolved_db_path();
+            let cascades = async {
+                let deleted = cascade_owned_state(
+                    &config,
+                    None,
+                    None,
+                    "retired",
+                    &tmp.path().join("archive"),
+                )
+                .await;
+                assert_eq!(deleted.knowledge_purged, 0);
+                assert!(deleted.warnings.is_empty(), "{:?}", deleted.warnings);
+                let renamed = cascade_rename_agent(&config, None, None, "retired", "renamed").await;
+                assert_eq!(renamed.knowledge_rows, 0);
+                assert!(renamed.warnings.is_empty(), "{:?}", renamed.warnings);
+                assert!(!path.exists());
+                assert!(!path.parent().unwrap().exists());
+            };
+            if negative_probe {
+                NEGATIVE_PROBE_PATH.scope(path.clone(), cascades).await;
+            } else {
+                cascades.await;
+            }
+        }
     }
 
     fn seed_owned_cron_job(config: &Config, alias: &str, prompt: &str) {
@@ -1198,7 +1366,7 @@ mod tests {
 
         seed_owned_cron_job(&config, "agent_a", "owned cron proof");
         let acp = AcpSessionStore::new(&config.data_dir).unwrap();
-        acp.create_session("owned-acp-proof", "agent_a", "/workspace")
+        acp.create_session("owned-acp-proof", "agent_a", "/workspace", None)
             .unwrap();
         acp.mark_session_killed("owned-acp-proof").unwrap();
         drop(acp);
