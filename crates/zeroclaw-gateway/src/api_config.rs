@@ -3436,9 +3436,11 @@ mod tests {
     async fn declarative_cron_schedule_test_rejects_stale_baseline() {
         let tmp = tempfile::tempdir().unwrap();
         let mut config = temp_config(&tmp);
-        let mut job = zeroclaw_config::schema::CronJobDecl::default();
-        job.schedule = zeroclaw_config::schema::CronScheduleDecl::Every { every_ms: 30000 };
-        job.command = Some("date".into());
+        let job = zeroclaw_config::schema::CronJobDecl {
+            schedule: zeroclaw_config::schema::CronScheduleDecl::Every { every_ms: 30000 },
+            command: Some("date".into()),
+            ..Default::default()
+        };
         config.cron.insert("daily".into(), job);
         config.save().await.unwrap();
         let before = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
