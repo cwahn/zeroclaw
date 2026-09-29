@@ -34,6 +34,8 @@ use zeroclaw_infra::net_guard::{
 use rustls::pki_types::pem::PemObject;
 use zeroclaw_api::plugin_egress::is_valid_tls_profile_name;
 use zeroclaw_api::plugin_key::SecretPropertyRef;
+#[cfg(feature = "plugins-wasmtime")]
+use zeroize::Zeroizing;
 
 use crate::PluginPermission;
 use crate::instance::{PluginInstanceId, PluginInstanceScope};
@@ -228,19 +230,60 @@ impl TlsProfile {
     }
 }
 
+/// The one provider decision for plugin TLS: rustls' *ring* provider with its
+/// safe default protocol versions.
+///
+/// Every plugin client configuration starts here, the plugin HTTPS trust
+/// assembly's included, so no plugin transport resolves the process-level
+/// default. `ClientConfig::builder()` does: it panics when the unified
+/// dependency graph compiles in more than one provider and no default was
+/// installed, and otherwise adopts whatever provider an embedder installed.
+///
+/// # Errors
+///
+/// Returns [`EgressError::PolicyUnavailable`] if the provider cannot offer the
+/// safe default protocol versions.
+#[cfg(feature = "plugins-wasmtime")]
+pub(crate) fn tls_client_builder()
+-> Result<rustls::ConfigBuilder<rustls::ClientConfig, rustls::WantsVerifier>, EgressError> {
+    rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .map_err(|_| {
+            EgressError::PolicyUnavailable(
+                "the ring TLS provider does not offer the default protocol versions".to_string(),
+            )
+        })
+}
+
+/// Whether a connection under `profile` trusts the roots plugin HTTPS trusts:
+/// always without a profile, and otherwise as the profile says.
+#[cfg(feature = "plugins-wasmtime")]
+pub(crate) fn trusts_system_roots(profile: Option<&TlsProfile>) -> bool {
+    profile.is_none_or(TlsProfile::uses_system_roots)
+}
+
 /// Build one rustls client configuration from an authorized TLS profile.
 ///
 /// `system_roots` is the root store plugin HTTPS already trusts, supplied by
 /// the caller so every plugin transport shares one trust decision. It is used
 /// when `profile` is `None` or the profile keeps system roots. `resolve_secret`
 /// is called only for references the profile actually uses, at the operation
-/// boundary, so no adapter holds a parallel copy of TLS material.
+/// boundary, so no adapter holds a parallel copy of TLS material. The client
+/// private-key PEM this function receives is held in zeroizing memory from the
+/// moment it is resolved, so every path out of this function wipes it, parse
+/// failures included.
+///
+/// The configuration uses rustls' *ring* provider, the same explicit choice
+/// plugin HTTPS makes for its own configuration, never the process-level
+/// default.
 ///
 /// # Errors
 ///
 /// Returns [`EgressError`] when a referenced secret is unavailable, PEM is
 /// malformed or empty, a CA certificate cannot be added, or a client
-/// certificate and key do not form a valid identity.
+/// certificate and key do not form a valid identity, and
+/// [`EgressError::PolicyUnavailable`] if the provider cannot offer the safe
+/// default protocol versions.
 #[cfg(feature = "plugins-wasmtime")]
 pub fn build_tls_client_config(
     profile: Option<&TlsProfile>,
@@ -251,7 +294,7 @@ pub fn build_tls_client_config(
         .map(|profile| profile.name().as_str())
         .unwrap_or("system-roots")
         .to_string();
-    let mut roots = if profile.is_none_or(TlsProfile::uses_system_roots) {
+    let mut roots = if trusts_system_roots(profile) {
         system_roots.clone()
     } else {
         rustls::RootCertStore::empty()
@@ -268,12 +311,14 @@ pub fn build_tls_client_config(
         }
     }
 
-    let builder = rustls::ClientConfig::builder().with_root_certificates(roots);
+    let builder = tls_client_builder()?.with_root_certificates(roots);
     let config = if let Some(identity) = profile.and_then(TlsProfile::client_identity) {
         let certificate_pem = resolve_secret(identity.certificate())?;
         let certificates =
             parse_pem_certificates(&certificate_pem, &profile_name, "client certificate")?;
-        let private_key_pem = resolve_secret(identity.private_key())?;
+        // Moved, not copied, into zeroizing ownership: the key text is wiped
+        // when this binding drops, including on the parse error below.
+        let private_key_pem = Zeroizing::new(resolve_secret(identity.private_key())?);
         let invalid_key = || EgressError::InvalidTlsMaterial {
             profile: profile_name.clone(),
             part: "client private key".to_string(),
@@ -551,14 +596,15 @@ impl EgressRequest {
         Ok(self)
     }
 
-    /// Host-issued logical instance identity.
-    #[must_use]
     /// The scope this request was made under.
+    #[must_use]
     #[cfg(feature = "plugins-wasmtime")]
     pub(crate) fn scope(&self) -> &PluginInstanceScope {
         &self.scope
     }
 
+    /// Host-issued logical instance identity.
+    #[must_use]
     pub fn instance_id(&self) -> &PluginInstanceId {
         self.scope.id()
     }
@@ -1456,6 +1502,94 @@ mod tests {
             )
         });
         assert!(config.is_ok());
+    }
+
+    /// The helper names its provider instead of resolving the process-level
+    /// default, so it neither panics when several providers are compiled in
+    /// nor adopts (or installs) a default someone else chose.
+    #[cfg(feature = "plugins-wasmtime")]
+    #[test]
+    fn tls_builder_selects_ring_without_a_process_default() {
+        let config = build_tls_client_config(None, &rustls::RootCertStore::empty(), |reference| {
+            panic!(
+                "no secret may be read without a profile, got {}",
+                reference.as_str()
+            )
+        })
+        .expect("ring offers the safe default protocol versions");
+
+        let provider = config.crypto_provider();
+        let suites = |suites: &[rustls::SupportedCipherSuite]| {
+            suites.iter().map(|suite| suite.suite()).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            suites(&provider.cipher_suites),
+            suites(rustls::crypto::ring::DEFAULT_CIPHER_SUITES)
+        );
+        let groups = |groups: &[&'static dyn rustls::crypto::SupportedKxGroup]| {
+            groups.iter().map(|group| group.name()).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            groups(&provider.kx_groups),
+            groups(rustls::crypto::ring::DEFAULT_KX_GROUPS),
+            "ring's key-exchange groups, not another provider's"
+        );
+        // Resolving the default through `ClientConfig::builder()` installs one
+        // when none exists and then shares it, so a provider that is the
+        // process default is the implicit path this helper must not take.
+        if let Some(process_default) = rustls::crypto::CryptoProvider::get_default() {
+            assert!(
+                !Arc::ptr_eq(provider, process_default),
+                "the helper must own its provider rather than share the process default"
+            );
+        }
+    }
+
+    #[cfg(feature = "plugins-wasmtime")]
+    #[test]
+    fn tls_builder_rejects_a_malformed_private_key() {
+        const MALFORMED_KEY: &str =
+            "-----BEGIN PRIVATE KEY-----\nnot-a-key\n-----END PRIVATE KEY-----\n";
+        let client = rcgen::generate_simple_self_signed(vec!["client.example".to_string()])
+            .expect("self-signed client certificate");
+        let identity = TlsProfile::new(
+            TlsProfileName::new("client-identity").unwrap(),
+            &owned(&["service.example"]),
+            true,
+            None,
+            Some(TlsClientIdentity::new(
+                secret("client_cert_pem"),
+                secret("client_key_pem"),
+            )),
+        )
+        .unwrap();
+
+        let error = build_tls_client_config(
+            Some(&identity),
+            &rustls::RootCertStore::empty(),
+            |reference| match reference.as_str() {
+                "client_cert_pem" => Ok(client.cert.pem()),
+                "client_key_pem" => Ok(MALFORMED_KEY.to_string()),
+                property => Err(EgressError::TlsSecretUnavailable {
+                    profile: "client-identity".to_string(),
+                    property: property.to_string(),
+                }),
+            },
+        )
+        .expect_err("a malformed key must not become a client identity");
+
+        assert!(
+            matches!(
+                &error,
+                EgressError::InvalidTlsMaterial { part, .. } if part == "client private key"
+            ),
+            "{error:?}"
+        );
+        let rendered = format!("{error} {error:?}");
+        assert!(
+            !rendered.contains("BEGIN") && !rendered.contains("not-a-key"),
+            "the error must not carry key text: {rendered}"
+        );
     }
 
     #[test]

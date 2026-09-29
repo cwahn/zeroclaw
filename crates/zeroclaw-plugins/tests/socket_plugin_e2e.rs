@@ -160,6 +160,11 @@ async fn plain_echo() -> u16 {
 
 /// Echo over TLS from the first byte.
 async fn tls_echo(acceptor: tokio_rustls::TlsAcceptor) -> u16 {
+    tls_echo_after(acceptor, std::time::Duration::ZERO).await
+}
+
+/// Echo over TLS from the first byte, holding each reply for `delay`.
+async fn tls_echo_after(acceptor: tokio_rustls::TlsAcceptor, delay: std::time::Duration) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let port = listener.local_addr().expect("addr").port();
     zeroclaw_spawn::spawn!(async move {
@@ -169,6 +174,9 @@ async fn tls_echo(acceptor: tokio_rustls::TlsAcceptor) -> u16 {
         };
         let mut bytes = [0_u8; 1024];
         while let Ok(count) = stream.read(&mut bytes).await {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
             if count == 0 || stream.write_all(&bytes[..count]).await.is_err() {
                 break;
             }
@@ -345,6 +353,25 @@ async fn direct_tls_trusts_a_custom_ca_only_through_the_selected_profile() {
     })
     .await;
     assert_eq!(trusted.as_deref(), Ok("ping"));
+}
+
+/// A reply that arrives well after the request must still reach the guest.
+/// `receive` never blocks and every poll spends one of the frame's host calls,
+/// so a guest that polled without pausing would exhaust that budget first and
+/// fail with `host-unavailable`, whenever the round trip is slower than its
+/// spin.
+#[tokio::test]
+async fn direct_tls_waits_out_a_slow_peer() {
+    let pki = TestPki::new();
+    let port = tls_echo_after(pki.acceptor(), std::time::Duration::from_millis(250)).await;
+    let delayed = run(Run {
+        mode: "tls",
+        profile: Some("corp"),
+        ca_pem: Some(&pki.ca_pem),
+        ..plain(port, Some(egress(&["localhost"], true)))
+    })
+    .await;
+    assert_eq!(delayed.as_deref(), Ok("ping"));
 }
 
 #[tokio::test]
