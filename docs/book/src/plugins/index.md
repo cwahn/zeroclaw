@@ -133,6 +133,50 @@ because verifying compiles and instantiates every component. A skill bundle
 ships no component, so it is reported as not applicable rather than as a
 failure.
 
+### Recovering an incomplete installation
+
+`zeroclaw plugin install` builds a package in a hidden staging directory,
+`.<name>.installing-<pid>` inside the plugins directory, and renames it into
+place only after the manifest, the component, and any `skills/` tree are
+written. A write that fails part-way, or a process that stops mid-install,
+therefore leaves nothing under the package name, and the next install starts
+fresh. Discovery never loads a dot-prefixed directory, so a staging directory
+stranded by a crash is ignored. Install only replaces the staging directory
+named for its own process, because one named for another process may belong
+to an install still running; delete such a leftover by hand once no install is
+running.
+
+Earlier builds wrote straight into the final directory, creating it and then
+writing `manifest.toml` first, so an interrupted install could leave an empty
+directory, a truncated manifest, or a manifest without its component.
+Discovery skips such a directory, so it is not an installed package, yet it
+still holds the name. `zeroclaw plugin install` never overwrites anything
+already at a package name: it refuses and names
+`zeroclaw plugin remove <name>` as the recovery.
+
+For a name the host has not loaded, `plugin remove` deletes the directory at
+that name, together with that name's leftover staging directories, in two
+cases only:
+
+- The directory is empty.
+- It holds a `manifest.toml` and fails the admission checks install and
+  discovery apply, because of its own contents: a truncated or unparsable
+  manifest, a missing component, a component that does not match its declared
+  `wasm_sha256`, or a package this host cannot accept as written, such as a
+  component over the admission size limit, a `config_schema` it cannot
+  compile, or an incomplete skill bundle.
+
+Everything else is left untouched, and the command prints why: a symlink or a
+file at the name, a directory that holds files but no `manifest.toml`, a
+directory it cannot inspect or list, the directory a loaded package was loaded
+from, a package admission accepts, and a package this host rejects for its
+signature policy (unsigned, from an untrusted publisher, carrying an invalid
+signature, or without a signed `wasm_sha256` in `strict` mode). Admission
+checks the signature before it reads the component, so under `strict` a
+stranded manifest from an unsigned package, or one cut so that its signature
+no longer verifies, is refused for its signature even though its component is
+missing. Delete any of these by hand if it should go.
+
 ## Execution model
 
 The host (`crates/zeroclaw-plugins/src/component.rs`) owns one async

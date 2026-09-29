@@ -417,22 +417,36 @@ impl PluginHost {
             return Err(PluginError::AlreadyLoaded(manifest.name));
         }
 
+        // The name is not loaded, yet something may occupy it: most often a
+        // package discovery skipped, such as one an older installer left
+        // half-written. It is judged without following a symlink and never
+        // overwritten; `remove` is the recovery path for an incomplete one.
         let dest_dir = self.plugins_dir.join(&manifest.name);
-        if dest_dir.exists() {
-            return Err(PluginError::AlreadyLoaded(manifest.name));
+        match std::fs::symlink_metadata(&dest_dir) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+            Ok(metadata) => {
+                return Err(PluginError::UnadmittedPackage {
+                    reason: self
+                        .kept_occupant(&dest_dir, &metadata)
+                        .unwrap_or_else(|| "it is a directory this host did not admit".to_string()),
+                    name: manifest.name,
+                });
+            }
         }
 
         // Build the package in a staging directory and rename it into place,
         // so a failed write (disk full, an unreadable skill file, an
         // interrupted process) never leaves a half-written package under the
-        // real name: that would block every retry with `AlreadyLoaded` while
-        // discovery skips it, leaving nothing `plugin remove` can find.
+        // real name, where it would block every retry until removed.
         // Discovery ignores dot-prefixed directories, so a staging directory
-        // stranded by a crash is never loaded either.
+        // stranded by a crash is never loaded either. Install replaces only
+        // its own process's staging directory: another one may belong to an
+        // install still in progress.
         std::fs::create_dir_all(&self.plugins_dir)?;
         let staging = self.plugins_dir.join(format!(
-            ".{}.installing-{}",
-            manifest.name,
+            "{}{}",
+            staging_prefix(&manifest.name),
             std::process::id()
         ));
         if staging.exists() {
@@ -465,9 +479,22 @@ impl PluginHost {
     }
 
     /// Remove a plugin by name.
+    ///
+    /// For a loaded plugin, the directory at its name is deleted. For a name the
+    /// host did not load, `remove` is the recovery path for an interrupted
+    /// install: it deletes the real directory at that name, with the name's
+    /// leftover staging directories, only when the directory is empty, or
+    /// holds a `manifest.toml` and admission rejects its own contents rather
+    /// than its signature. That includes a package this host cannot accept as
+    /// written, such as one whose component exceeds the admission size limit.
+    /// Anything else at the name is left untouched and reported as
+    /// [`PluginError::UnadmittedPackage`] with the reason: a symlink or file, a
+    /// directory holding files but no manifest, one that cannot be identified,
+    /// inspected, or listed, a loaded package's directory, a package admission
+    /// accepts, and one this host rejects for its signature policy.
     pub fn remove(&mut self, name: &str) -> Result<(), PluginError> {
         if self.loaded.remove(name).is_none() {
-            return Err(PluginError::NotFound(name.to_string()));
+            return self.remove_unadmitted(name);
         }
 
         let plugin_dir = self.plugins_dir.join(name);
@@ -475,6 +502,156 @@ impl PluginHost {
             std::fs::remove_dir_all(plugin_dir)?;
         }
 
+        Ok(())
+    }
+
+    /// The recovery half of [`Self::remove`], for a name the host did not load.
+    ///
+    /// Every installer created the package directory and wrote
+    /// `manifest.toml` first, so an interrupted install leaves either an empty
+    /// directory or one holding a manifest. For the second shape, whether the
+    /// package is complete is decided by [`Self::admit_source`] run against
+    /// it, so recovery cannot disagree with install and discovery about what
+    /// a complete package is.
+    fn remove_unadmitted(&self, name: &str) -> Result<(), PluginError> {
+        let untouched = |reason: String| PluginError::UnadmittedPackage {
+            name: name.to_string(),
+            reason,
+        };
+
+        // Only a canonical package slug names exactly one entry directly in
+        // the plugins directory: never empty, `..`, a hidden staging name, or
+        // a path with separators.
+        crate::instance::validate_package_name(name)
+            .map_err(|_| PluginError::NotFound(name.to_string()))?;
+        let package_dir = self.plugins_dir.join(name);
+        let metadata = match std::fs::symlink_metadata(&package_dir) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(PluginError::NotFound(name.to_string()));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if let Some(reason) = self.kept_occupant(&package_dir, &metadata) {
+            return Err(untouched(reason));
+        }
+
+        // Probed without following a symlink: a missing manifest and one that
+        // cannot be inspected are different answers, and only the first may
+        // lead to a delete.
+        match std::fs::symlink_metadata(package_dir.join("manifest.toml")) {
+            Ok(manifest) if manifest.is_file() => {}
+            Ok(_) => {
+                return Err(untouched(
+                    "its manifest.toml is not a regular file, so no install wrote it".to_string(),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return self.remove_empty_stranded_dir(name, &package_dir);
+            }
+            Err(error) => {
+                return Err(untouched(format!(
+                    "its manifest.toml cannot be inspected ({error})"
+                )));
+            }
+        }
+
+        let source = package_dir
+            .to_str()
+            .ok_or_else(|| untouched("its path is not valid UTF-8".to_string()))?;
+        match self.admit_source(source) {
+            Ok(_) => {
+                return Err(untouched(
+                    "admission accepts the package it holds".to_string(),
+                ));
+            }
+            Err(error) if !is_structural_admission_failure(&error) => {
+                return Err(untouched(error.to_string()));
+            }
+            Err(_) => {}
+        }
+        // Deleting needs a listable directory; find that out before sweeping.
+        std::fs::read_dir(&package_dir)
+            .map_err(|error| untouched(format!("it cannot be listed ({error})")))?;
+
+        // Staging goes first: while the stranded directory holds the name, a
+        // new install of it stops at its destination check before staging, so
+        // what is swept here was left by earlier installs. A failure part way
+        // leaves the stranded directory in place for a retry.
+        self.remove_stale_staging(name)?;
+        std::fs::remove_dir_all(&package_dir)?;
+        Ok(())
+    }
+
+    /// Recover a stranded directory that has no manifest: only an empty one,
+    /// the shape an install interrupted right after creating it leaves.
+    fn remove_empty_stranded_dir(&self, name: &str, package_dir: &Path) -> Result<(), PluginError> {
+        let has_entries = std::fs::read_dir(package_dir)
+            .map_err(|error| PluginError::UnadmittedPackage {
+                name: name.to_string(),
+                reason: format!("it cannot be listed ({error})"),
+            })?
+            .next()
+            .is_some();
+        if has_entries {
+            return Err(PluginError::UnadmittedPackage {
+                name: name.to_string(),
+                reason: "it holds files but no manifest.toml, so no interrupted install left it"
+                    .to_string(),
+            });
+        }
+        self.remove_stale_staging(name)?;
+        // Unlike `remove_dir_all`, this refuses a directory that gained an
+        // entry since it was found empty.
+        std::fs::remove_dir(package_dir)?;
+        Ok(())
+    }
+
+    /// Why whatever is at `path` (described by its `symlink_metadata`) is not
+    /// recovery's to delete, or `None` for a real directory no loaded package
+    /// lives in.
+    fn kept_occupant(&self, path: &Path, metadata: &std::fs::Metadata) -> Option<String> {
+        if metadata.file_type().is_symlink() {
+            return Some("it is a symlink, which is never followed".to_string());
+        }
+        if !metadata.is_dir() {
+            return Some("it is not a directory".to_string());
+        }
+        // A loaded package's files are never recovery's, whatever its
+        // manifest reads by now. Compared by file identity, not spelling: on a
+        // case-insensitive file system a slug reaches a directory spelled in
+        // another case. A directory that cannot be identified is kept.
+        let target = match directory_identity(path) {
+            Ok(target) => target,
+            Err(error) => return Some(format!("it cannot be identified ({error})")),
+        };
+        self.loaded
+            .values()
+            .find(|plugin| {
+                directory_identity(&plugin.plugin_dir).is_ok_and(|loaded| loaded == target)
+            })
+            .map(|plugin| format!("plugin '{}' is loaded from it", plugin.manifest.name))
+    }
+
+    /// Delete the staging directories an interrupted install left for `name`.
+    /// Only real directories named exactly `.<name>.installing-<pid>` match.
+    fn remove_stale_staging(&self, name: &str) -> Result<(), PluginError> {
+        let prefix = staging_prefix(name);
+        for entry in std::fs::read_dir(&self.plugins_dir)? {
+            let entry = entry?;
+            // A numeric suffix also keeps out the staging directory of a
+            // package whose own name extends this one, such as
+            // `<name>.installing-x`.
+            let is_staging = entry.file_name().to_str().is_some_and(|file_name| {
+                file_name.strip_prefix(prefix.as_str()).is_some_and(|pid| {
+                    !pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit())
+                })
+            });
+            // `DirEntry::file_type` does not follow a symlink.
+            if is_staging && entry.file_type()?.is_dir() {
+                std::fs::remove_dir_all(entry.path())?;
+            }
+        }
         Ok(())
     }
 
@@ -955,6 +1132,70 @@ fn validate_skill_md_frontmatter(plugin_name: &str, skill_md: &Path) -> Result<(
     Ok(())
 }
 
+/// Name prefix of every staging directory a package is built in: the owning
+/// process id completes it. Dot-prefixed, so discovery never loads one.
+fn staging_prefix(package: &str) -> String {
+    format!(".{package}.installing-")
+}
+
+/// A directory's identity, so two spellings of one directory compare equal.
+/// Read from its metadata without opening it.
+#[cfg(unix)]
+fn directory_identity(path: &Path) -> std::io::Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::symlink_metadata(path)?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+/// A directory's identity, so two spellings of one directory compare equal.
+#[cfg(not(unix))]
+fn directory_identity(path: &Path) -> std::io::Result<same_file::Handle> {
+    same_file::Handle::from_path(path)
+}
+
+/// Whether an admission failure comes from the package directory's own
+/// contents: a truncated or unparsable manifest, a missing component, a
+/// component that does not match its declared digest, or anything else this
+/// host cannot accept as written, such as a component over the admission size
+/// limit, a `config_schema` it cannot compile, or an incomplete skill bundle.
+/// For a directory that holds a `manifest.toml`, this is the only verdict
+/// under which `remove` deletes a directory the host never loaded, whether an
+/// interrupted install left it or it holds a package this host could never
+/// load.
+///
+/// Every other outcome keeps the directory. A trust-policy failure describes a
+/// package this host declines to load under its signature policy; admission
+/// checks the signature before the component, so under `strict` that includes
+/// an unsigned interrupted install.
+/// `AlreadyLoaded` means the manifest names a package the host has loaded. An
+/// I/O error says nothing about the package. The match has no wildcard arm, so
+/// a new error variant does not compile until it is classified here.
+fn is_structural_admission_failure(error: &PluginError) -> bool {
+    match error {
+        PluginError::NotFound(_)
+        | PluginError::InvalidManifest(_)
+        | PluginError::TomlParse(_)
+        | PluginError::PayloadDigestInvalid(_)
+        | PluginError::PayloadDigestMismatch { .. } => true,
+        // A manifest cut off inside a multi-byte character is not UTF-8.
+        PluginError::Io(error) => error.kind() == std::io::ErrorKind::InvalidData,
+        PluginError::UnsignedPlugin(_)
+        | PluginError::UntrustedPublisher { .. }
+        | PluginError::SignatureInvalid(_)
+        | PluginError::PayloadDigestRequired(_)
+        | PluginError::AlreadyLoaded(_)
+        | PluginError::UnadmittedPackage { .. }
+        | PluginError::InvalidConfig(_)
+        | PluginError::InvalidInstanceId(_)
+        | PluginError::InvalidEndpoint(_)
+        | PluginError::LoadFailed(_)
+        | PluginError::ExecutionFailed(_)
+        | PluginError::PermissionDenied { .. }
+        | PluginError::UnsupportedCapability(_) => false,
+    }
+}
+
 /// Write an admitted package into `dir`: the exact manifest and component
 /// bytes admission read, plus the `skills/` subtree of a skill-capable package.
 fn write_package(
@@ -967,12 +1208,20 @@ fn write_package(
     std::fs::create_dir(dir)?;
 
     // Persist the exact manifest and payload generations admitted above.
+    #[cfg(test)]
+    write_fault::inject(
+        write_fault::Step::Manifest,
+        &dir.join("manifest.toml"),
+        manifest_toml.as_bytes(),
+    )?;
     std::fs::write(dir.join("manifest.toml"), manifest_toml.as_bytes())?;
     if let (Some(rel), Some(component)) = (manifest.wasm_path.as_deref(), component) {
         let dest = dir.join(rel);
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        #[cfg(test)]
+        write_fault::inject(write_fault::Step::Payload, &dest, component.bytes())?;
         std::fs::write(&dest, component.bytes())?;
     }
 
@@ -1030,6 +1279,56 @@ pub fn migrate_plugins_dir(from: &Path, to: &Path) -> Result<usize, PluginError>
         moved += 1;
     }
     Ok(moved)
+}
+
+/// Test-only write fault injected into [`write_package`].
+///
+/// Production compiles this away entirely. Under test it cuts the armed write
+/// off part-way, as a full disk or a killed process would, which is what lets
+/// a case prove that a failure at that exact step leaves nothing behind. The
+/// slot is thread-local, so a case running in parallel with others arms only
+/// its own install.
+#[cfg(test)]
+mod write_fault {
+    /// A write in [`super::write_package`] a test can make fail.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum Step {
+        Manifest,
+        Payload,
+    }
+
+    thread_local! {
+        static ARMED: std::cell::Cell<Option<Step>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// Clears the slot on drop, so a fault never leaks into a later case
+    /// that runs on the same thread.
+    pub(super) struct Armed;
+
+    impl Drop for Armed {
+        fn drop(&mut self) {
+            ARMED.with(|armed| armed.set(None));
+        }
+    }
+
+    /// Make the next `step` write on this thread fail. It fires once.
+    pub(super) fn arm(step: Step) -> Armed {
+        ARMED.with(|armed| armed.set(Some(step)));
+        Armed
+    }
+
+    /// When `step` is armed, write the first half of `bytes` to `path` and
+    /// fail, leaving the truncated file an interrupted write would.
+    pub(super) fn inject(step: Step, path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+        if ARMED.with(|armed| armed.get()) != Some(step) {
+            return Ok(());
+        }
+        ARMED.with(|armed| armed.set(None));
+        std::fs::write(path, &bytes[..bytes.len() / 2])?;
+        Err(std::io::Error::other(format!(
+            "injected {step:?} write fault"
+        )))
+    }
 }
 
 #[cfg(test)]
@@ -1941,7 +2240,7 @@ capabilities = ["tool"]
 
     /// An install that fails part-way leaves nothing under the package name and
     /// no staging directory, so the retry after the cause is fixed succeeds
-    /// instead of hitting `AlreadyLoaded` on a half-written package. The
+    /// instead of being refused by a half-written package. The
     /// failure is real: admission reads only each skill's `SKILL.md`, so an
     /// unreadable extra file passes admission and fails the copy.
     #[cfg(unix)]
@@ -1988,6 +2287,511 @@ capabilities = ["tool"]
 
         let host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
         assert!(host.list_plugins().is_empty());
+    }
+
+    /// Sorted names of every entry in `dir`, hidden ones included.
+    fn dir_entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Every file of a flat package directory with its exact bytes.
+    fn package_bytes(dir: &Path) -> Vec<(String, Vec<u8>)> {
+        dir_entries(dir)
+            .into_iter()
+            .map(|name| {
+                let bytes = std::fs::read(dir.join(&name)).unwrap();
+                (name, bytes)
+            })
+            .collect()
+    }
+
+    /// Cut one write of an install off part-way, then check what is left.
+    ///
+    /// The plugins directory must list exactly what it held before, hidden
+    /// entries included, so a leftover staging directory fails the check as
+    /// surely as a final one would. The package already installed stays
+    /// byte-identical, and the retry installs the exact source bytes.
+    fn assert_a_write_fault_leaves_nothing_behind(step: write_fault::Step) {
+        let plugins = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        let existing = tempdir().unwrap();
+        write_tool_source(existing.path(), "other", b"\0asm other");
+        host.install(existing.path().to_str().unwrap()).unwrap();
+        let other_before = package_bytes(&plugins.path().join("other"));
+
+        let source = tempdir().unwrap();
+        write_tool_source(source.path(), "faulty", b"\0asm faulty");
+        let armed = write_fault::arm(step);
+        let err = host
+            .install(source.path().to_str().unwrap())
+            .expect_err("the injected write fault must fail the install");
+        drop(armed);
+        assert!(err.to_string().contains("injected"), "{err}");
+
+        assert_eq!(
+            dir_entries(plugins.path()),
+            ["other"],
+            "a {step:?} write fault left something behind"
+        );
+        assert!(host.get_plugin("faulty").is_none());
+        assert_eq!(package_bytes(&plugins.path().join("other")), other_before);
+
+        assert_eq!(
+            host.install(source.path().to_str().unwrap()).unwrap(),
+            "faulty"
+        );
+        assert_eq!(
+            package_bytes(&plugins.path().join("faulty")),
+            package_bytes(source.path()),
+            "the retry installs the exact source bytes"
+        );
+        assert_eq!(package_bytes(&plugins.path().join("other")), other_before);
+    }
+
+    #[test]
+    fn a_manifest_write_fault_leaves_nothing_behind_and_the_retry_succeeds() {
+        assert_a_write_fault_leaves_nothing_behind(write_fault::Step::Manifest);
+    }
+
+    #[test]
+    fn a_payload_write_fault_leaves_nothing_behind_and_the_retry_succeeds() {
+        assert_a_write_fault_leaves_nothing_behind(write_fault::Step::Payload);
+    }
+
+    /// What an installer that wrote straight into the package directory left
+    /// when it stopped: right after creating the directory, inside the
+    /// manifest write (at a line, or inside a multi-byte character), between
+    /// the manifest and the payload, and inside the payload write. Discovery
+    /// skips each one. Install refuses it as unadmitted rather than
+    /// `AlreadyLoaded` and leaves it and all staging alone; `remove` deletes it
+    /// with the name's stale staging directories only; the retry installs.
+    #[test]
+    fn a_stranded_unadmitted_directory_is_reported_distinctly_and_recoverable() {
+        let payload: &[u8] = b"\0asm complete";
+        let manifest = format!(
+            "name = \"stranded\"\nversion = \"0.1.0\"\ndescription = \"\u{dc}bersetzt\"\nwasm_path = \"plugin.wasm\"\nwasm_sha256 = \"{}\"\ncapabilities = [\"tool\"]\n",
+            signature::sha256_hex(payload)
+        );
+        let manifest = manifest.as_bytes();
+        let first_line = manifest.iter().position(|&byte| byte == b'\n').unwrap() + 1;
+        let mid_character = manifest.iter().position(|&byte| byte >= 0x80).unwrap() + 1;
+        /// A stranded shape: its label, then each file it holds and its bytes.
+        type Shape<'a> = (&'a str, &'a [(&'a str, &'a [u8])]);
+        let shapes: [Shape<'_>; 5] = [
+            ("the directory alone", &[]),
+            (
+                "a manifest cut at a line",
+                &[("manifest.toml", &manifest[..first_line])],
+            ),
+            (
+                "a manifest cut inside a character",
+                &[("manifest.toml", &manifest[..mid_character])],
+            ),
+            (
+                "a manifest without its payload",
+                &[("manifest.toml", manifest)],
+            ),
+            (
+                "a payload cut short",
+                &[
+                    ("manifest.toml", manifest),
+                    ("plugin.wasm", &payload[..payload.len() / 2]),
+                ],
+            ),
+        ];
+
+        let source = tempdir().unwrap();
+        std::fs::write(source.path().join("manifest.toml"), manifest).unwrap();
+        std::fs::write(source.path().join("plugin.wasm"), payload).unwrap();
+
+        for (shape, files) in shapes {
+            let plugins = tempdir().unwrap();
+            let stranded = plugins.path().join("stranded");
+            std::fs::create_dir(&stranded).unwrap();
+            for (file, bytes) in files {
+                std::fs::write(stranded.join(file), bytes).unwrap();
+            }
+            let stale = plugins.path().join(".stranded.installing-4242");
+            std::fs::create_dir(&stale).unwrap();
+            std::fs::write(stale.join("manifest.toml"), manifest).unwrap();
+            // Staging owned by other names: another package, and one whose
+            // name merely extends this one.
+            let unrelated = plugins.path().join(".other.installing-4242");
+            let extended = plugins
+                .path()
+                .join(".stranded.installing-x.installing-4242");
+            std::fs::create_dir(&unrelated).unwrap();
+            std::fs::create_dir(&extended).unwrap();
+            // A staging-shaped symlink is never followed, nor removed.
+            #[cfg(unix)]
+            let (linked_staging, link_target) = {
+                let target = tempdir().unwrap();
+                std::fs::write(target.path().join("keep.txt"), "kept").unwrap();
+                let link = plugins.path().join(".stranded.installing-4243");
+                std::os::unix::fs::symlink(target.path(), &link).unwrap();
+                (link, target)
+            };
+
+            let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+            assert!(host.get_plugin("stranded").is_none(), "{shape}: discovered");
+            let before = package_bytes(&stranded);
+
+            let err = host
+                .install(source.path().to_str().unwrap())
+                .expect_err("the stranded directory must block the install");
+            assert!(
+                matches!(err, PluginError::UnadmittedPackage { ref name, .. } if name == "stranded"),
+                "{shape}: {err}"
+            );
+            assert_eq!(package_bytes(&stranded), before, "{shape}: install wrote");
+            assert!(stale.is_dir(), "{shape}: install swept staging");
+
+            host.remove("stranded")
+                .unwrap_or_else(|err| panic!("{shape}: remove must recover it: {err}"));
+            assert!(!stranded.exists(), "{shape}: the directory survived");
+            assert!(!stale.exists(), "{shape}: its stale staging survived");
+            assert!(
+                unrelated.is_dir() && extended.is_dir(),
+                "{shape}: over-swept"
+            );
+            #[cfg(unix)]
+            {
+                assert!(
+                    std::fs::symlink_metadata(&linked_staging)
+                        .unwrap()
+                        .file_type()
+                        .is_symlink(),
+                    "{shape}: a staging-shaped symlink was removed"
+                );
+                assert!(link_target.path().join("keep.txt").is_file());
+            }
+
+            assert_eq!(
+                host.install(source.path().to_str().unwrap()).unwrap(),
+                "stranded",
+                "{shape}: the retry must install"
+            );
+            assert_eq!(package_bytes(&stranded), package_bytes(source.path()));
+        }
+    }
+
+    /// A manifest-less directory is deleted only when it is empty. Every
+    /// installer wrote `manifest.toml` right after creating the directory, so
+    /// one that holds anything, or whose `manifest.toml` is not a file, was
+    /// never an install: it is refused with its reason and nothing is swept.
+    #[test]
+    fn remove_keeps_directories_no_install_left() {
+        for (label, occupant) in [
+            ("files but no manifest", "notes"),
+            ("a manifest.toml that is a directory", "odd"),
+        ] {
+            let plugins = tempdir().unwrap();
+            let dir = plugins.path().join(occupant);
+            if occupant == "notes" {
+                std::fs::create_dir_all(dir.join("drafts")).unwrap();
+                std::fs::write(dir.join("todo.txt"), "keep me").unwrap();
+                std::fs::write(dir.join("drafts").join("a.md"), "draft").unwrap();
+            } else {
+                std::fs::create_dir_all(dir.join("manifest.toml")).unwrap();
+            }
+            let staging = plugins.path().join(format!(".{occupant}.installing-4242"));
+            std::fs::create_dir(&staging).unwrap();
+            let before = dir_entries(&dir);
+
+            let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+            let err = host
+                .remove(occupant)
+                .expect_err("a directory no install left must be kept");
+            let PluginError::UnadmittedPackage { name, reason } = &err else {
+                panic!("{label}: {err}");
+            };
+            assert_eq!(name, occupant);
+            assert!(reason.contains("manifest.toml"), "{label}: {reason}");
+            assert_eq!(dir_entries(&dir), before, "{label}: contents changed");
+            assert!(staging.is_dir(), "{label}: staging was swept");
+        }
+    }
+
+    /// A directory recovery cannot inspect or list is refused before anything
+    /// is swept. At 0o600 its manifest cannot be looked up, which is not the
+    /// same as missing. At 0o300 the manifest reads and admission rejects the
+    /// package, but the directory cannot be listed, so a delete would fail
+    /// after the sweep.
+    #[cfg(unix)]
+    #[test]
+    fn remove_refuses_a_directory_it_cannot_inspect_and_sweeps_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for (mode, expected) in [(0o600, "cannot be inspected"), (0o300, "cannot be listed")] {
+            let plugins = tempdir().unwrap();
+            let locked = plugins.path().join("locked");
+            std::fs::create_dir(&locked).unwrap();
+            // No capabilities: a shape admission rejects as the package's own.
+            std::fs::write(
+                locked.join("manifest.toml"),
+                "name = \"locked\"\nversion = \"0.1.0\"\ncapabilities = []\n",
+            )
+            .unwrap();
+            let staging = plugins.path().join(".locked.installing-7");
+            std::fs::create_dir(&staging).unwrap();
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(mode)).unwrap();
+            let restore = || {
+                std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+            };
+            if std::fs::read_dir(&locked).is_ok()
+                && std::fs::symlink_metadata(locked.join("manifest.toml")).is_ok()
+            {
+                // Running as root: permissions hide nothing.
+                restore();
+                return;
+            }
+
+            let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+            let err = host.remove("locked");
+            restore();
+
+            let Err(PluginError::UnadmittedPackage { reason, .. }) = &err else {
+                panic!("{mode:o}: an uninspectable directory must be refused: {err:?}");
+            };
+            assert!(reason.contains(expected), "{mode:o}: {reason}");
+            assert!(staging.is_dir(), "{mode:o}: staging was swept");
+            assert_eq!(dir_entries(&locked), ["manifest.toml"], "{mode:o}");
+        }
+    }
+
+    /// A file at a package name is not a package directory. Install refuses
+    /// to overwrite it, and `remove` says why it will not delete it instead of
+    /// answering "not found".
+    #[test]
+    fn a_file_at_the_package_name_is_refused_by_install_and_remove() {
+        let plugins = tempdir().unwrap();
+        let file = plugins.path().join("filey");
+        std::fs::write(&file, "not a package").unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+
+        let source = tempdir().unwrap();
+        write_tool_source(source.path(), "filey", b"\0asm");
+        let err = host
+            .install(source.path().to_str().unwrap())
+            .expect_err("install must not overwrite a file");
+        assert!(
+            matches!(&err, PluginError::UnadmittedPackage { reason, .. } if reason.contains("not a directory")),
+            "{err}"
+        );
+
+        let err = host
+            .remove("filey")
+            .expect_err("remove must not delete a file");
+        assert!(
+            matches!(&err, PluginError::UnadmittedPackage { reason, .. } if reason.contains("not a directory")),
+            "{err}"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "not a package");
+    }
+
+    /// A package the host did not load is kept when admission accepts it or
+    /// rejects it for its signature, and the refusal carries admission's own
+    /// verdict: one a strict signature policy rejects, and one that appeared
+    /// after the host looked.
+    #[test]
+    fn remove_refuses_a_valid_package_it_did_not_load() {
+        let dir = tempdir().unwrap();
+        write_unsigned_tool_plugin(dir.path(), "unsigned-tool");
+        let package = dir.path().join("unsigned-tool");
+        let before = package_bytes(&package);
+        let mut strict = PluginHost::from_plugins_dir_with_security(
+            dir.path(),
+            SignatureMode::Strict,
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(strict.get_plugin("unsigned-tool").is_none());
+
+        let err = strict
+            .remove("unsigned-tool")
+            .expect_err("a package failing only trust policy is not incomplete");
+        assert!(
+            matches!(
+                &err,
+                PluginError::UnadmittedPackage { name, reason }
+                    if name == "unsigned-tool" && reason.contains("unsigned")
+            ),
+            "{err}"
+        );
+        assert_eq!(package_bytes(&package), before);
+
+        let later = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir(later.path()).unwrap();
+        write_unsigned_tool_plugin(later.path(), "late-tool");
+        let err = host
+            .remove("late-tool")
+            .expect_err("a package that admits cleanly is not incomplete");
+        assert!(
+            matches!(&err, PluginError::UnadmittedPackage { reason, .. } if reason.contains("admission accepts")),
+            "{err}"
+        );
+        assert!(later.path().join("late-tool/plugin.wasm").is_file());
+    }
+
+    /// Discovery loads a package under the name its manifest declares, from
+    /// whatever directory holds it. Removing the directory's own name must not
+    /// delete a loaded package's files, even once its manifest no longer
+    /// parses, which admission alone would count as the directory's own
+    /// defect.
+    #[test]
+    fn remove_keeps_a_directory_that_holds_a_loaded_package() {
+        let dir = tempdir().unwrap();
+        let misnamed = dir.path().join("misnamed");
+        std::fs::create_dir(&misnamed).unwrap();
+        write_tool_source(&misnamed, "declared", b"\0asm");
+        let mut host = PluginHost::from_plugins_dir(dir.path()).unwrap();
+        assert!(host.get_plugin("declared").is_some());
+
+        let err = host
+            .remove("misnamed")
+            .expect_err("a loaded package's directory is kept");
+        assert!(
+            matches!(&err, PluginError::UnadmittedPackage { reason, .. } if reason.contains("'declared'")),
+            "{err}"
+        );
+
+        std::fs::write(misnamed.join("manifest.toml"), "name = ").unwrap();
+        let err = host
+            .remove("misnamed")
+            .expect_err("a loaded package's directory is kept whatever its manifest reads");
+        assert!(
+            matches!(&err, PluginError::UnadmittedPackage { reason, .. } if reason.contains("'declared'")),
+            "{err}"
+        );
+        assert!(misnamed.join("plugin.wasm").is_file());
+        assert!(host.get_plugin("declared").is_some());
+
+        // A copy that appeared later elsewhere and names the loaded package is
+        // kept too: admission answers `AlreadyLoaded` before it reads the
+        // missing component, and that verdict is not the copy's own defect.
+        let copy = dir.path().join("copy");
+        std::fs::create_dir(&copy).unwrap();
+        std::fs::write(
+            copy.join("manifest.toml"),
+            "name = \"declared\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"tool\"]\n",
+        )
+        .unwrap();
+        let err = host
+            .remove("copy")
+            .expect_err("a copy naming a loaded package is kept");
+        assert!(
+            matches!(&err, PluginError::UnadmittedPackage { reason, .. } if reason.contains("already loaded")),
+            "{err}"
+        );
+        assert!(copy.join("manifest.toml").is_file());
+    }
+
+    /// The loaded-directory guard compares file identity, not spelling. On a
+    /// case-insensitive file system a lowercase slug reaches a directory
+    /// spelled in another case, and that is still the loaded package's
+    /// directory, even after its manifest stops parsing.
+    #[cfg(unix)]
+    #[test]
+    fn remove_keeps_a_loaded_package_directory_reached_through_another_case() {
+        let dir = tempdir().unwrap();
+        let cased = dir.path().join("Casey");
+        std::fs::create_dir(&cased).unwrap();
+        write_tool_source(&cased, "casedecl", b"\0asm");
+        if !dir.path().join("casey").is_dir() {
+            // A case-sensitive file system: `casey` names nothing, so there
+            // is no second spelling to guard against.
+            return;
+        }
+        let mut host = PluginHost::from_plugins_dir(dir.path()).unwrap();
+        assert!(host.get_plugin("casedecl").is_some());
+
+        std::fs::write(cased.join("manifest.toml"), "name = ").unwrap();
+        let err = host
+            .remove("casey")
+            .expect_err("a loaded package's directory is kept under any spelling");
+        assert!(
+            matches!(&err, PluginError::UnadmittedPackage { reason, .. } if reason.contains("'casedecl' is loaded from it")),
+            "{err}"
+        );
+        assert!(cased.join("plugin.wasm").is_file());
+    }
+
+    /// Recovery never follows a symlinked package root, even to a directory
+    /// it would recover if it were real, and sweeps nothing for that name.
+    #[cfg(unix)]
+    #[test]
+    fn remove_refuses_a_symlinked_package_dir() {
+        use std::os::unix::fs::symlink;
+
+        let plugins = tempdir().unwrap();
+        let external = tempdir().unwrap();
+        std::fs::write(
+            external.path().join("manifest.toml"),
+            "name = \"linked\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"tool\"]\n",
+        )
+        .unwrap();
+        let link = plugins.path().join("linked");
+        symlink(external.path(), &link).unwrap();
+        let staging = plugins.path().join(".linked.installing-4242");
+        std::fs::create_dir(&staging).unwrap();
+
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        let err = host
+            .remove("linked")
+            .expect_err("a symlinked package root must be refused");
+        assert!(
+            matches!(&err, PluginError::UnadmittedPackage { reason, .. } if reason.contains("symlink")),
+            "{err}"
+        );
+        assert!(external.path().join("manifest.toml").is_file());
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(staging.is_dir());
+    }
+
+    /// Only a package slug reaches the file system. Each target is an empty
+    /// directory, which recovery deletes, so the name check is what keeps it.
+    /// The plugins directory and its parent (`""`, `.`, `..`) are not empty
+    /// either, which would refuse them a second time.
+    #[test]
+    fn remove_rejects_a_non_slug_name() {
+        let root = tempdir().unwrap();
+        let plugins = root.path().join("plugins");
+        let mut host = PluginHost::from_plugins_dir(&plugins).unwrap();
+        let targets = [
+            root.path().join("outside"),
+            plugins.join(".hidden.installing-4242"),
+            plugins.join("Upper"),
+            plugins.join("nested").join("dir"),
+        ];
+        for target in &targets {
+            std::fs::create_dir_all(target).unwrap();
+        }
+
+        for name in [
+            "",
+            ".",
+            "..",
+            "../outside",
+            ".hidden.installing-4242",
+            "Upper",
+            "nested/dir",
+        ] {
+            let err = host
+                .remove(name)
+                .expect_err("a non-slug name must be refused");
+            assert!(matches!(err, PluginError::NotFound(_)), "{name:?}: {err}");
+        }
+        assert!(targets.iter().all(|target| target.is_dir()));
     }
 
     /// A symlinked `skills/` root is refused at admission, like a symlinked

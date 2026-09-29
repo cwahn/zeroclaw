@@ -31,6 +31,14 @@ pub enum PluginError {
     #[error("plugin '{0}' is already loaded")]
     AlreadyLoaded(String),
 
+    /// Something occupies a package name in the plugins directory that the host
+    /// has not admitted as that package, and it was left as found. Install
+    /// never overwrites it. `remove` deletes an unloaded directory only when it
+    /// is empty, or when admission rejects its own contents rather than its
+    /// signature. `reason` says why it was kept.
+    #[error("'{name}' in the plugins directory was left untouched: {reason}")]
+    UnadmittedPackage { name: String, reason: String },
+
     #[error("plugin capability not supported: {0}")]
     UnsupportedCapability(String),
 
