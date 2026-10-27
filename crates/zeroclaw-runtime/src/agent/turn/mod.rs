@@ -7048,7 +7048,7 @@ mod sop_step_reassembly_tests {
         // provider construction and cross-agent assembly. Each step gets one
         // immediate send call, followed by a final response after its result.
         Mock::given(method("POST"))
-            .and(path("/api/chat"))
+            .and(path("/v1/chat/completions"))
             .respond_with(move |request: &wiremock::Request| {
                 let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
                 let result = body["messages"]
@@ -7064,13 +7064,15 @@ mod sop_step_reassembly_tests {
                     serde_json::json!({"role":"assistant", "content":"done"})
                 } else {
                     serde_json::json!({"role":"assistant", "content":"", "tool_calls":[{
-                        "function":{"name":"send_via", "arguments":{
+                        "id":"fixture-send", "type":"function",
+                        "function":{"name":"send_via", "arguments":serde_json::json!({
                             "target":"webhook.fixture", "body":"fixture body"
-                        }}
+                        }).to_string()}
                     }]})
                 };
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "model":"fixture", "message":message, "done":true
+                    "id":"fixture-response", "model":"fixture",
+                    "choices":[{"index":0, "message":message, "finish_reason":"stop"}]
                 }))
             })
             .expect(6)
