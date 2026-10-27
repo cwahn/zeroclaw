@@ -7010,7 +7010,10 @@ mod sop_step_reassembly_tests {
                 String::from_utf8_lossy(&output.stderr)
             );
             // An accidentally stale --exact filter must not pass with zero tests.
-            assert_eq!(std::fs::read(receipt).expect("child ran the fixture"), b"ok");
+            assert_eq!(
+                std::fs::read(receipt).expect("child ran the fixture"),
+                b"ok"
+            );
             return;
         }
         tokio::runtime::Runtime::new()
