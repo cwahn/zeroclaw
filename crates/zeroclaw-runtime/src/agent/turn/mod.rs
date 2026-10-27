@@ -6969,13 +6969,15 @@ mod sop_step_reassembly_tests {
         // fixture alone rather than racing other channel-factory unit tests.
         const CHILD: &str = "ZEROCLAW_SOP_CHANNEL_TEST_CHILD";
         if std::env::var_os(CHILD).is_none() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let receipt = tmp.path().join("passed");
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
                     "agent::turn::sop_step_reassembly_tests::cross_agent_channel_delivery_uses_step_authority",
                     "--nocapture",
                 ])
-                .env(CHILD, "1")
+                .env(CHILD, &receipt)
                 .output()
                 .expect("isolated channel test starts");
             assert!(
@@ -6984,11 +6986,14 @@ mod sop_step_reassembly_tests {
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
+            // An accidentally stale --exact filter must not pass with zero tests.
+            assert_eq!(std::fs::read(receipt).expect("child ran the fixture"), b"ok");
             return;
         }
         tokio::runtime::Runtime::new()
             .unwrap()
             .block_on(check_cross_agent_channel_delivery());
+        std::fs::write(std::env::var_os(CHILD).unwrap(), b"ok").unwrap();
     }
 
     async fn check_cross_agent_channel_delivery() {
