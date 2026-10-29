@@ -26,14 +26,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: '1.96.0'
-          components: rustfmt
+          components: rustfmt, clippy
       - run: rustfmt --edition 2024 --check crates/zeroclaw-runtime/src/agent/turn/mod.rs
       # Protect cross-agent channel authority for this v0.8.6 fork patch;
       # retire this publisher when the upstream repair is adopted.
       - run: cargo test -p zeroclaw-runtime --lib sop_step_reassembly_tests --locked
-      - run: rustfmt --edition 2024 --check crates/zeroclaw-tools/src/a2a_client.rs crates/zeroclaw-gateway/src/a2a.rs
+      - run: rustfmt --edition 2024 --check crates/zeroclaw-tools/src/a2a_client.rs crates/zeroclaw-gateway/src/a2a.rs crates/zeroclaw-config/src/env_overrides.rs crates/zeroclaw-config/src/multi_agent.rs
       - run: cargo test -p zeroclaw-tools --lib a2a_client::tests --locked
       - run: cargo test -p zeroclaw-gateway --lib a2a::tests --locked
+      # PR #12098: prove the deployment overrides resolve to native discovery
+      # settings; retire with this fork publisher after upstream adoption.
+      - run: cargo test -p zeroclaw-config --lib --locked
       - run: cargo clippy -p zeroclaw-tools -p zeroclaw-gateway --lib --locked -- -D warnings
 
   publish:
