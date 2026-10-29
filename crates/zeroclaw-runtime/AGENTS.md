@@ -70,4 +70,101 @@ An exception permits continued work on a subsystem already held here. It never p
 
 The configuration application's `config_application.rs` is the existing `LiveConfigAuthority`'s private bounded result ledger. It uses that authority's lifetime, publication revision and epoch, and existing consumer acknowledgements. It does not introduce an independent service, scheduler, persistence owner, or new live consumer.
 
+### Proposed exceptions (not active)
+
+**PendingCoreTeamReview: no placement permission is granted here.** The following
+proposal is separate from the native feature changes. Neither this proposal's
+presence nor its acceptance into a fork establishes Core Team approval. Native
+feature merges and publication remain blocked until the required Core Team
+approval is recorded through normal review and the approved scope, authority,
+decision link and review condition are entered in the active-exception table.
+No existing approval above covers the additions proposed below.
+
+| Proposal | Permitted scope requested | Intended destination | Approval state / required authority | Review condition requested |
+| --- | --- | --- | --- | --- |
+| Native SOP renewal boundaries | Only the paths and behavior enumerated below; implemented persistence, qualified context/release and durable keyed admission/recovery, plus explicitly planned native guard/result-validation integration | Existing SOP execution, settlement and run-store owner in the planned `zeroclaw-kernel` extraction; RPC adapters follow its IPC owner; process-identity reuse follows its control-plane owner | **PendingCoreTeamReview. Not approved.** Core Team decision required; no approver or waiver is claimed | Review at the first SOP execution/settlement, RPC or control-plane extraction design review, or before expanding paths, callers, recovery eligibility, retention, authority or continuation rules. This is a review condition, not a calendar expiry |
+
+#### Receiving caller and placement rationale
+
+The concrete receiving caller is a trusted renewal coordinator, or a compatible
+authenticated operator client, using local IPC to inspect the loaded native run,
+submit a context-qualified gate decision and retry a stable keyed start. The
+client must require the advertised methods and pin a compatible native revision;
+older binaries may ignore unknown decision preconditions. Authentication and
+existing execution grants remain necessary, not sufficient proof of a protected
+operation's authority.
+
+The request continues the existing `SopEngine`, approval broker and `SopRunStore`;
+it does not introduce a renewal subsystem into runtime. Extracting only these
+adapters now would split the engine's loaded-definition, gate and transactional
+run-store boundary. The proposed destination follows the existing SOP settlement
+exception above, not a promise to invent a new crate. Business orchestration,
+external coordination, effect reconciliation policy and business approvals stay
+outside this crate. The native store, not the coordinator's cache or audit-memory
+projection, remains authoritative for native run identity and durable admission.
+
+#### Enumerated native scope
+
+All paths in this list are relative to `crates/zeroclaw-runtime`. "Implemented"
+means present in the separate, unmerged native patch, not approved or shipped.
+
+- **Implemented definition persistence:** `src/sop/mod.rs` preserves step policy,
+  gate prompt, editable fields and capability metadata across save/load, including
+  escaped multiline strings. `src/sop/approval/broker.rs` is included only for
+  save/reload authorization regressions. A successful save is not a loaded-engine
+  activation acknowledgement.
+- **Implemented qualified context/release:** `src/sop/{engine,types}.rs` and
+  `src/rpc/dispatch.rs` project the loaded definition digest, run ID, step,
+  existing presentation revision and optional durable revision, then check the
+  supplied tuple under the engine mutex before a broker decision. No vote or gate
+  mutation on mismatch. Legacy unqualified calls remain legacy behavior, not a
+  protected-operation guarantee; the tuple is consistency evidence, not authority.
+- **Implemented durable keyed admission/recovery:** `src/sop/{engine,types,mod,graph}.rs`,
+  `src/sop/store/{mod,sqlite}.rs`, `src/sop/store/sqlite/keyed.rs` and
+  `src/rpc/dispatch.rs` bind a key to the authenticated principal namespace and
+  exact request specification in the existing file-backed SQLite store. Admission
+  commits the key, initial run, claim and event atomically before driver handoff;
+  retries return the same run without action replay. Non-durable stores fail
+  closed. `src/control_plane/boot.rs` is included only to expose its existing
+  process identity for native claim ownership, not to add a recovery service.
+  Keyed obligations remain pinned through ordinary pruning. Proven-dead owners
+  park interrupted execution as nonterminal `recovery_required`, preserving claims
+  and results without replay, inferred business disposition or public resume API.
+  Live or uncertain owners are not reclaimed. Compatible binary/data recovery is
+  required before downgrade; old writers must not prune keyed obligations.
+- **Planned, not implemented or validated:** integration in existing
+  `src/sop/{engine,executor}.rs` and `src/rpc/dispatch.rs` for mandatory protected
+  operation admission and authoritative result/receipt validation before native
+  continuation or technical failure. Reuse the native execution, approval and
+  result boundaries; no new coordinator, scheduler, grant source or independent
+  validation service. Missing, stale or mismatched authority/evidence must stop
+  continuation. Context checks and keyed identity alone do not satisfy this work.
+  If complete enforcement requires additional paths or a wider contract, stop and
+  obtain a separately bounded Core Team decision rather than treating this list
+  as authority for them. No recovery-resume endpoint is proposed here.
+
+Focused regressions in the enumerated owners are included in the request. Shared
+wire types remain in `zeroclaw-api`, configuration persistence in `zeroclaw-config`,
+and dashboard projections in the web client; their review obligations are not
+waived or relocated into runtime. This documentation-only proposal carries none
+of those implementation changes and makes no runtime-test or readiness claim.
+
+#### Excluded activation and other boundaries
+
+Expanded live activation consumers are **excluded and blocked pending a separate
+bounded proposal and recorded Core Team decision**. In particular, the active
+configuration-application exception expressly excludes new live consumers; its
+committed-revision receipts are not proof that an SOP engine or approval-policy
+consumer loaded a saved definition. This proposal requests no changes to
+`src/{config_application,live_config_authority}.rs`, daemon reload wiring, plugin
+activation or their consumer contracts. The activation delta is not sufficiently
+bounded here to propose its path scope safely.
+
+No new subsystem, business coordinator, external workflow engine, HTTP/WS/channel
+rollout, tool mutation surface, permission bypass, automatic recovery replay,
+exactly-once external-effects guarantee, key-deletion API, release/workflow change
+or feature publication is covered. Existing SOP exceptions remain limited to their
+own recorded scopes. Any covered native feature still needs its own correctness,
+security, compatibility and regression review after placement is approved.
+
 **Stability tier:** Experimental; no stability guarantee. Decomposition begins at v0.8.0.
