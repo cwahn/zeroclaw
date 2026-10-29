@@ -2,7 +2,7 @@ name: Fork SOP channel image
 
 on:
   push:
-    branches: [fix/sop-channel-v086, feat/agent-discovery-20261029]
+    branches: [fix/sop-channel-v086]
   workflow_dispatch:
 
 permissions:
