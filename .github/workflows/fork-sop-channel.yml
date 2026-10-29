@@ -3,6 +3,8 @@ name: Fork SOP channel image
 on:
   push:
     branches: [fix/sop-channel-v086]
+  pull_request:
+    branches: [fix/sop-channel-v086]
   workflow_dispatch:
 
 permissions:
@@ -27,13 +29,18 @@ jobs:
         with:
           toolchain: '1.96.0'
           components: rustfmt
-      - run: rustfmt --edition 2024 --check crates/zeroclaw-runtime/src/agent/turn/mod.rs
+      - run: rustfmt --edition 2024 --check crates/zeroclaw-runtime/src/agent/turn/mod.rs crates/zeroclaw-gateway/src/api_config.rs crates/zeroclaw-runtime/src/rpc/dispatch.rs
       # Protect cross-agent channel authority for this v0.8.6 fork patch;
       # retire this publisher when the upstream repair is adopted.
       - run: cargo test -p zeroclaw-runtime --lib sop_step_reassembly_tests --locked
+      # Config reconciliation must not restart the shared daemon. Retire when
+      # the fork is replaced by an upstream release with manual-only reloads.
+      - run: cargo test -p zeroclaw-gateway --lib api_config::tests --locked
+      - run: cargo test -p zeroclaw-gateway --lib admin_reload --locked
+      - run: cargo test -p zeroclaw-runtime --lib config --locked
 
   publish:
-    if: github.repository == 'cwahn/zeroclaw'
+    if: github.repository == 'cwahn/zeroclaw' && github.event_name != 'pull_request' && github.ref == 'refs/heads/fix/sop-channel-v086'
     needs: test
     runs-on: ubuntu-latest
     timeout-minutes: 180
