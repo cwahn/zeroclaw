@@ -428,18 +428,6 @@ fn channel_generation_projection(config: &zeroclaw_config::schema::Config) -> se
     })
 }
 
-fn schedule_channel_generation_reload(
-    pending_reload: Arc<std::sync::atomic::AtomicBool>,
-    controls: zeroclaw_runtime::daemon::GatewayReloadControls,
-) {
-    zeroclaw_spawn::spawn!(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        pending_reload.store(false, std::sync::atomic::Ordering::Relaxed);
-        let _ = controls.shutdown_tx.send(true);
-        let _ = controls.send(true);
-    });
-}
-
 pub(crate) struct RetainedConfigWrite {
     _guard: ConfigWriteGuard,
     _agent_reservations: Vec<zeroclaw_runtime::live_config_authority::AgentAdmissionReservation>,
@@ -489,7 +477,7 @@ async fn persist_and_swap_retaining(
                 authorization,
             )
             .await?;
-            finish_prepared_channel_generation(prepared, pending_reload).await;
+            finish_prepared_channel_generation(prepared).await;
             if let Err(e) =
                 zeroclaw_config::comment_writer::apply_comments(&config_path, &annotations).await
             {
@@ -614,13 +602,7 @@ async fn persist_and_swap_prepared(
     reload_controls: Option<zeroclaw_runtime::daemon::GatewayReloadControls>,
     mut new_config: zeroclaw_config::schema::Config,
     authorization: ConfigWriteAuthorization,
-) -> Result<
-    Option<(
-        zeroclaw_runtime::daemon::PreparedChannelGenerationDrain,
-        zeroclaw_runtime::daemon::GatewayReloadControls,
-    )>,
-    Response,
-> {
+) -> Result<Option<zeroclaw_runtime::daemon::PreparedChannelGenerationDrain>, Response> {
     authorization
         .covers_all(new_config.dirty_paths.iter().map(String::as_str))
         .map_err(IntoResponse::into_response)?;
@@ -636,17 +618,12 @@ async fn persist_and_swap_prepared(
     };
     let prepared_channel_generation = if channel_generation_changed {
         match reload_controls {
-            Some(controls) => Some((
-                controls
-                    .prepare_channel_generation()
-                    .ok_or_else(|| {
-                        error_response(ConfigApiError::new(
-                            ConfigApiCode::ReloadFailed,
-                            "channel generation controls are unavailable; refusing a live channel mutation",
-                        ))
-                    })?,
-                controls,
-            )),
+            Some(controls) => Some(controls.prepare_channel_generation().ok_or_else(|| {
+                error_response(ConfigApiError::new(
+                    ConfigApiCode::ReloadFailed,
+                    "channel generation controls are unavailable; refusing a live channel mutation",
+                ))
+            })?),
             None => None,
         }
     } else {
@@ -689,21 +666,20 @@ async fn persist_and_swap_prepared(
     Ok(prepared_channel_generation)
 }
 
-/// Drain the prepared channel generation and schedule the daemon reload.
+/// Drain the prepared channel generation without restarting the daemon.
 /// Called by the retained commit task after its publication (and, for the
 /// destructive cascades, after their alias-generation commit), while still
 /// inside the commit's serialization, preserving the historical boundary
 /// between config commits and channel retirement.
+/// Retirement is idempotent and does not close config-commit admission, so
+/// further writes can complete against the same retired channel generation.
+/// Channels stay fail-closed until the operator explicitly calls /admin/reload;
+/// only that endpoint clears pending_reload and signals daemon shutdown/reload.
 async fn finish_prepared_channel_generation(
-    prepared: Option<(
-        zeroclaw_runtime::daemon::PreparedChannelGenerationDrain,
-        zeroclaw_runtime::daemon::GatewayReloadControls,
-    )>,
-    pending_reload: Arc<std::sync::atomic::AtomicBool>,
+    prepared: Option<zeroclaw_runtime::daemon::PreparedChannelGenerationDrain>,
 ) {
-    if let Some((prepared, controls)) = prepared {
+    if let Some(prepared) = prepared {
         prepared.begin().wait().await;
-        schedule_channel_generation_reload(pending_reload, controls);
     }
 }
 
@@ -757,8 +733,8 @@ pub struct ChannelBindBody {
 /// (`bind_channel_identity_into`), writes ONLY to
 /// `peer_groups.<type>_<alias>.external_peers`, and is gated by the same
 /// bearer auth as every other config write. Publishes the shared config,
-/// drains the supervised channel generation and schedules daemon reload
-/// without requiring an in-chat `/bind` message.
+/// drains the supervised channel generation without requiring an in-chat
+/// `/bind` message. An explicit admin reload restarts channels after the batch.
 pub async fn handle_api_channel_bind(
     State(state): State<AppState>,
     principal: RequestPrincipal,
@@ -1626,8 +1602,8 @@ async fn delete_agent_cascade(
             // Synchronous — no await between the live swap and this commit.
             lifecycle_lease.commit_destructive_mutation();
             // Retire and await the channel generation while still holding the
-            // config write guard, then schedule the daemon reload.
-            finish_prepared_channel_generation(prepared, pending_reload).await;
+            // config write guard. Restart remains an explicit admin action.
+            finish_prepared_channel_generation(prepared).await;
             // Release the gateway-wide config write lock before slow cleanup.
             drop(guard);
             let archive = crate::agent_owned_state::archive_agent_workspace(
@@ -2392,8 +2368,8 @@ async fn rename_agent_cascade(
             lease.commit_destructive_mutation();
         }
         // Retire and await the channel generation while still holding the
-        // config write guard, then schedule the daemon reload.
-        finish_prepared_channel_generation(prepared, pending_reload).await;
+        // config write guard. Restart remains an explicit admin action.
+        finish_prepared_channel_generation(prepared).await;
         // Release the gateway-wide config write lock before slow cleanup.
         drop(guard);
         let move_warning = move_renamed_workspace(&old_ws, &new_ws).await;
@@ -3539,6 +3515,7 @@ mod tests {
         std::fs::create_dir_all(&config_path).unwrap();
         let mut config = temp_config(&tmp);
         config.config_path = config_path;
+        let original_cli = config.channels.cli;
         let mut state = test_state(config.clone());
         let clears = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let clear_count = Arc::clone(&clears);
@@ -3562,6 +3539,12 @@ mod tests {
         );
         assert_eq!(clears.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(!*reload_rx.borrow_and_update());
+        assert!(
+            !state
+                .pending_reload
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+        assert_eq!(state.config.read().channels.cli, original_cli);
     }
 
     #[cfg(unix)]
@@ -3592,8 +3575,8 @@ mod tests {
         assert_eq!(std::fs::read(&config_path).unwrap(), original);
     }
 
-    #[tokio::test]
-    async fn channel_generation_is_cleared_before_reload_is_signalled() {
+    #[tokio::test(start_paused = true)]
+    async fn channel_generation_is_retired_but_daemon_waits_for_manual_reload() {
         let tmp = tempfile::tempdir().unwrap();
         let config = temp_config(&tmp);
         let mut state = test_state(config.clone());
@@ -3605,6 +3588,7 @@ mod tests {
                 clear_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }),
         );
+        let shutdown_rx = state.reload_tx.as_ref().unwrap().shutdown_tx.subscribe();
         let mut working = config;
         working.channels.cli = !working.channels.cli;
         working.mark_dirty("channels.cli");
@@ -3612,16 +3596,202 @@ mod tests {
 
         let authorization =
             authorize_config_write(&None, ConfigWriteSet::default(), &guard).unwrap();
-        let _guard = persist_and_swap(&state, authorization, working, guard)
+        let retained = persist_and_swap(&state, authorization, working, guard)
             .await
             .unwrap();
         assert_eq!(clears.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert!(!*reload_rx.borrow_and_update());
+        drop(retained);
+        // A retired generation must still accept the rest of a controller batch.
+        let guard = state.begin_config_commit().await.unwrap();
+        let mut working = guard.current_config();
+        working.channels.cli = !working.channels.cli;
+        working.mark_dirty("channels.cli");
+        let authorization =
+            authorize_config_write(&None, ConfigWriteSet::default(), &guard).unwrap();
+        drop(
+            persist_and_swap(&state, authorization, working, guard)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(clears.load(std::sync::atomic::Ordering::SeqCst), 1);
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(!reload_rx.has_changed().unwrap());
+        assert!(!shutdown_rx.has_changed().unwrap());
+        assert!(
+            state
+                .pending_reload
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+
+        let shutdown_rx = state.shutdown_tx.subscribe();
+        let response = crate::handle_admin_reload(
+            State(state.clone()),
+            axum::extract::ConnectInfo("127.0.0.1:40000".parse().unwrap()),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            !state
+                .pending_reload
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
         tokio::time::timeout(std::time::Duration::from_secs(1), reload_rx.changed())
             .await
-            .expect("reload must be signalled after the response flush delay")
+            .expect("manual reload must signal the daemon")
             .unwrap();
         assert!(*reload_rx.borrow());
+        assert!(*shutdown_rx.borrow());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn controller_config_crud_batches_do_not_shutdown_or_reload_daemon() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = config_with_telegram_alias(&tmp, "primary");
+        config.save().await.unwrap();
+        let mut state = test_state(config);
+        let clears = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = Arc::clone(&clears);
+        let reload_rx = install_channel_generation_controls(
+            &mut state,
+            Arc::new(move || {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }),
+        );
+        let shutdown_rx = state.reload_tx.as_ref().unwrap().shutdown_tx.subscribe();
+        let gateway_shutdown_rx = state.shutdown_tx.subscribe();
+        for (section, ops) in [
+            (
+                "channels.telegram",
+                serde_json::json!([
+                    {"op": "replace", "path": "/channels/telegram/batch/bot_token", "value": "test-token"}
+                ]),
+            ),
+            (
+                "agents",
+                serde_json::json!([
+                    {"op": "replace", "path": "/agents/batch/enabled", "value": false},
+                    {"op": "replace", "path": "/agents/batch/channels", "value": ["telegram.primary"]}
+                ]),
+            ),
+            (
+                "peer_groups",
+                serde_json::json!([
+                    {"op": "replace", "path": "/peer_groups/batch/channel", "value": "telegram.primary"},
+                    {"op": "replace", "path": "/peer_groups/batch/external_peers", "value": ["123456789"]}
+                ]),
+            ),
+        ] {
+            let generation = state.agent_lifecycle.alias_generation("batch");
+            for step in 0..4 {
+                let renamed_generation = state.agent_lifecycle.alias_generation("renamed");
+                let response = match step {
+                    0 => {
+                        Box::pin(handle_map_key(
+                            State(state.clone()),
+                            None,
+                            Query(MapKeyQuery {
+                                path: section.into(),
+                                key: "batch".into(),
+                            }),
+                        ))
+                        .await
+                    }
+                    1 => {
+                        Box::pin(handle_patch(
+                            State(state.clone()),
+                            None,
+                            HeaderMap::new(),
+                            Json(ops.clone()),
+                        ))
+                        .await
+                    }
+                    2 => {
+                        Box::pin(handle_rename_map_key(
+                            State(state.clone()),
+                            None,
+                            Json(RenameMapKeyBody {
+                                path: section.into(),
+                                from: "batch".into(),
+                                to: "renamed".into(),
+                            }),
+                        ))
+                        .await
+                    }
+                    _ => {
+                        Box::pin(handle_delete_map_key(
+                            State(state.clone()),
+                            None,
+                            Query(MapKeyQuery {
+                                path: section.into(),
+                                key: "renamed".into(),
+                            }),
+                        ))
+                        .await
+                    }
+                };
+                let (status, json) = response_json(response).await;
+                assert_eq!(status, StatusCode::OK, "{section} step {step}: {json}");
+                if section == "agents" && step == 1 {
+                    let (status, json) = response_json(
+                        handle_prop_put(
+                            State(state.clone()),
+                            None,
+                            Json(PropPutBody {
+                                path: "agents.batch.enabled".into(),
+                                value: serde_json::json!(true),
+                                comment: None,
+                            }),
+                        )
+                        .await,
+                    )
+                    .await;
+                    assert_eq!(status, StatusCode::OK, "enable agent: {json}");
+                }
+                if section == "agents" && step == 3 {
+                    assert_eq!(
+                        state.agent_lifecycle.alias_generation("renamed"),
+                        renamed_generation + 1
+                    );
+                    assert!(
+                        state
+                            .agent_lifecycle
+                            .reserve_turn_at("renamed", renamed_generation)
+                            .is_err()
+                    );
+                }
+                tokio::time::advance(std::time::Duration::from_secs(1)).await;
+                tokio::task::yield_now().await;
+                assert!(!reload_rx.has_changed().unwrap(), "{section} step {step}");
+                assert!(!shutdown_rx.has_changed().unwrap());
+                assert!(!gateway_shutdown_rx.has_changed().unwrap());
+                assert!(
+                    state
+                        .pending_reload
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                );
+                assert_eq!(
+                    clears.load(std::sync::atomic::Ordering::SeqCst),
+                    1,
+                    "channel admission stays retired throughout the batch"
+                );
+            }
+            if section == "agents" {
+                assert!(matches!(state.agent_lifecycle.reserve_turn_at("batch", generation),
+                    Err(zeroclaw_runtime::live_config_authority::AgentAdmissionError::StaleGeneration { .. })));
+                assert!(!state.config.read().agents.contains_key("renamed"));
+            }
+            let config_path = state.config.read().config_path.clone();
+            let raw = tokio::fs::read_to_string(config_path).await.unwrap();
+            let persisted: zeroclaw_config::schema::Config = toml::from_str(&raw).unwrap();
+            assert_eq!(
+                persisted.get_map_keys(section).unwrap(),
+                state.config.read().get_map_keys(section).unwrap()
+            );
+        }
     }
 
     async fn response_json(response: Response) -> (StatusCode, serde_json::Value) {

@@ -978,7 +978,7 @@ pub(crate) struct RpcConfigCommitEffects {
     /// sessions bound to one alias whose channel authorization changed.
     channel_handle_refresh: Option<(Box<zeroclaw_config::schema::Config>, Vec<String>)>,
     /// Prepared channel-generation retirement for channel-affecting
-    /// mutations; drains and schedules the daemon reload.
+    /// mutations; drains without automatically restarting the daemon.
     channel_generation: Option<PreparedChannelGenerationMutation>,
 }
 
@@ -1062,8 +1062,6 @@ fn schedule_daemon_reload_from_parts(
 async fn drain_channel_generation_without_dispatcher(
     sessions: Arc<crate::rpc::session::SessionStore>,
     prepared: Option<PreparedChannelGenerationMutation>,
-    reload_tx: Option<tokio::sync::watch::Sender<bool>>,
-    gateway_shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
 ) {
     let Some(prepared) = prepared else {
         return;
@@ -1088,7 +1086,9 @@ async fn drain_channel_generation_without_dispatcher(
         );
     }
     drain_wait.wait().await;
-    schedule_daemon_reload_from_parts(reload_tx, gateway_shutdown_tx, "config-channel-generation");
+    // Keep the old immutable routing/authorization generation retired until an
+    // explicit config/reload (or /admin/reload). Retirement is idempotent and
+    // leaves config-write admission open for the rest of an operator's batch.
 }
 
 /// Refresh live channel handles for sessions bound to `agent_alias`
@@ -3236,8 +3236,6 @@ impl RpcDispatcher {
         }
         let ctx = Arc::clone(&self.ctx);
         let sessions = Arc::clone(&ctx.sessions);
-        let reload_tx = self.ctx.reload_tx.clone();
-        let gateway_shutdown_tx = self.ctx.gateway_shutdown_tx.clone();
         let task = crate::live_config_authority::spawn_agent_lifecycle_job(Box::pin(async move {
             // `commit` is owned by this task: serialization and drain
             // accounting live until the effects below finish.
@@ -3265,8 +3263,6 @@ impl RpcDispatcher {
                 drain_channel_generation_without_dispatcher(
                     Arc::clone(&sessions),
                     effects.channel_generation,
-                    reload_tx,
-                    gateway_shutdown_tx,
                 )
                 .await;
                 if let Some((config_path, annotations)) = effects.comments
@@ -10504,8 +10500,6 @@ impl RpcDispatcher {
                 // control all live in a task that request cancellation
                 // cannot abort.
                 let cleanup_sessions = Arc::clone(&self.ctx.sessions);
-                let cleanup_reload_tx = self.ctx.reload_tx.clone();
-                let cleanup_gateway_shutdown_tx = self.ctx.gateway_shutdown_tx.clone();
                 let from = req.from.clone();
                 let to = req.to.clone();
                 let memory = self.ctx.memory.clone();
@@ -10542,13 +10536,11 @@ impl RpcDispatcher {
                             lease.commit_destructive_mutation();
                         }
                         // Retire and await the channel generation while still
-                        // holding the commit's serialization, then schedule
-                        // reload.
+                        // holding the commit's serialization. Restart remains
+                        // an explicit operator action.
                         drain_channel_generation_without_dispatcher(
                             cleanup_sessions,
                             channel_generation_revocation,
-                            cleanup_reload_tx,
-                            cleanup_gateway_shutdown_tx,
                         )
                         .await;
                         // Release the commit's serialization (writer guard
@@ -10793,8 +10785,6 @@ impl RpcDispatcher {
         let session_backend = self.ctx.session_backend.clone();
         let cleanup_alias = alias.clone();
         let cleanup_sessions = Arc::clone(&self.ctx.sessions);
-        let cleanup_reload_tx = self.ctx.reload_tx.clone();
-        let cleanup_gateway_shutdown_tx = self.ctx.gateway_shutdown_tx.clone();
         // Spawn the retained transaction BEFORE the first persistence await.
         // Config persistence becomes externally visible when config.toml is
         // atomically renamed, before `save_dirty` returns, so the config
@@ -10826,13 +10816,11 @@ impl RpcDispatcher {
                 // commit.
                 lifecycle_lease.commit_destructive_mutation();
                 // Retire and await the existing channel generation while
-                // still holding the commit's serialization, then schedule
-                // the daemon reload.
+                // still holding the commit's serialization. Restart remains
+                // an explicit operator action.
                 drain_channel_generation_without_dispatcher(
                     cleanup_sessions,
                     channel_generation_revocation,
-                    cleanup_reload_tx,
-                    cleanup_gateway_shutdown_tx,
                 )
                 .await;
                 // Release the commit's serialization (writer guard and
@@ -35805,6 +35793,90 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn config_channel_batches_wait_for_explicit_rpc_reload() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_secret_test_config(&tmp);
+        let new_cli = !config.channels.cli;
+        config.save().await.unwrap();
+        let (mut dispatcher, clears) = make_supervised_generation_dispatcher(config);
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        Arc::get_mut(&mut dispatcher.ctx)
+            .unwrap()
+            .gateway_shutdown_tx = Some(shutdown_tx);
+        let mut reload_rx = dispatcher.ctx.reload_tx.as_ref().unwrap().subscribe();
+        for (prop, value) in [
+            ("channels.cli", json!(new_cli)),
+            ("agents.batch_owner.enabled", json!(false)),
+            ("agents.batch_owner.channels", json!(["cli"])),
+            ("agents.batch_owner.enabled", json!(true)),
+            ("peer_groups.batch.channel", json!("cli")),
+            ("peer_groups.batch.external_peers", json!(["test-peer"])),
+        ] {
+            dispatcher
+                .handle_config_set(&json!({"prop": prop, "value": value}))
+                .await
+                .unwrap_or_else(|error| panic!("{prop}: {error:?}"));
+            tokio::time::advance(std::time::Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+            assert!(!reload_rx.has_changed().unwrap(), "{prop} must not reload");
+            assert!(
+                !shutdown_rx.has_changed().unwrap(),
+                "{prop} must not shut down the gateway"
+            );
+            assert_eq!(clears.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+        assert!(dispatcher.ctx.config.read().agents["batch_owner"].enabled);
+        assert!(
+            dispatcher
+                .ctx
+                .channel_generation_control
+                .as_ref()
+                .unwrap()
+                .prepare()
+                .is_some()
+        );
+        let commit = dispatcher.ctx.begin_config_commit().await.unwrap();
+        drop(commit);
+        assert!(dispatcher.handle_config_reload().is_ok());
+        tokio::time::timeout(std::time::Duration::from_secs(1), shutdown_rx.changed())
+            .await
+            .expect("manual reload must shut down the gateway")
+            .unwrap();
+        assert!(*shutdown_rx.borrow());
+        assert!(
+            !*reload_rx.borrow(),
+            "gateway shutdown precedes manual reload"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), reload_rx.changed())
+            .await
+            .expect("manual reload must signal the daemon")
+            .unwrap();
+        assert!(*reload_rx.borrow());
+    }
+
+    #[tokio::test]
+    async fn config_channel_save_failure_does_not_retire_or_reload() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_secret_test_config(&tmp);
+        let blocked = tmp.path().join("not-a-directory");
+        std::fs::write(&blocked, "blocked").unwrap();
+        config.config_path = blocked.join("config.toml");
+        let old_cli = config.channels.cli;
+        let (dispatcher, clears) = make_supervised_generation_dispatcher(config);
+        let reload_rx = dispatcher.ctx.reload_tx.as_ref().unwrap().subscribe();
+        let before = dispatcher.ctx.config.snapshot_with_revision();
+        dispatcher
+            .handle_config_set(&json!({"prop": "channels.cli", "value": !old_cli}))
+            .await
+            .expect_err("save must fail before retirement");
+        assert_eq!(clears.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!reload_rx.has_changed().unwrap());
+        let after = dispatcher.ctx.config.snapshot_with_revision();
+        assert_eq!(after.1, before.1);
+        assert_eq!(after.0.channels.cli, old_cli);
+    }
+
     #[tokio::test]
     async fn agent_delete_save_failure_preserves_config_and_workspace() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -35901,7 +35973,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn config_completion_survives_request_cancellation_during_channel_drain() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = make_secret_test_config(&tmp);
@@ -35909,7 +35981,7 @@ mod tests {
         config.save().await.unwrap();
         let (dispatcher, clears) = make_supervised_generation_dispatcher(config);
         let ctx = Arc::clone(&dispatcher.ctx);
-        let mut reload = ctx.reload_tx.as_ref().unwrap().subscribe();
+        let reload = ctx.reload_tx.as_ref().unwrap().subscribe();
         let token = tokio_util::sync::CancellationToken::new();
         let generation = ctx
             .sessions
@@ -35935,16 +36007,17 @@ mod tests {
             "reload must not precede drain completion"
         );
         ctx.sessions.remove_cancel_token("drain-gate", generation);
-        tokio::time::timeout(std::time::Duration::from_secs(5), reload.changed())
-            .await
-            .expect("retained completion must reload after caller cancellation")
-            .unwrap();
-        assert!(*reload.borrow());
         let _guard =
             tokio::time::timeout(std::time::Duration::from_secs(5), ctx.begin_config_commit())
                 .await
                 .expect("completed drain must release the writer")
                 .expect("config admission remains open");
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !reload.has_changed().unwrap(),
+            "retained completion must wait for manual reload"
+        );
     }
 
     #[test]
