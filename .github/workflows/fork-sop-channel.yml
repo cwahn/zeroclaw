@@ -2,7 +2,7 @@ name: Fork SOP channel image
 
 on:
   push:
-    branches: [fix/sop-channel-v086]
+    branches: [fix/sop-channel-v086, feat/agent-discovery-20261029]
   workflow_dispatch:
 
 permissions:
@@ -31,6 +31,10 @@ jobs:
       # Protect cross-agent channel authority for this v0.8.6 fork patch;
       # retire this publisher when the upstream repair is adopted.
       - run: cargo test -p zeroclaw-runtime --lib sop_step_reassembly_tests --locked
+      - run: rustfmt --edition 2024 --check crates/zeroclaw-tools/src/a2a_client.rs crates/zeroclaw-gateway/src/a2a.rs
+      - run: cargo test -p zeroclaw-tools --lib a2a_client::tests --locked
+      - run: cargo test -p zeroclaw-gateway --lib a2a::tests --locked
+      - run: cargo clippy -p zeroclaw-tools -p zeroclaw-gateway --lib --locked -- -D warnings
 
   publish:
     if: github.repository == 'cwahn/zeroclaw'
